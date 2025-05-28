@@ -290,7 +290,7 @@ class Trajectory:
         Args:
             filename (str): Output file name.
             filetype (str, optional): 'csv', 'npy', 'npz', or 'txt'. Inferred from extension if not given.
-        """
+        
         if filetype is None:
             if filename.endswith('.csv'):
                 filetype = 'csv'
