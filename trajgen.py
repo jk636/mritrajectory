@@ -1987,4 +1987,448 @@ def reconstruct_image(kspace_data: np.ndarray,
     if verbose: print("Image reconstruction complete.")
     
     return image_magnitude
+
+
+def generate_3d_cones_trajectory(
+    num_cones: int, 
+    num_samples_per_cone: int, 
+    max_k_rad_per_m: float, 
+    cone_angle_deg: float, 
+    revolutions_per_cone: float = 5.0, 
+    central_density_factor: float = 1.0, # Placeholder, not implemented in this version
+    distribute_cones_method: str = "sequential_uniform_phi", 
+    name: str = "3d_cones", 
+    dt_seconds: float = 4e-6
+) -> Trajectory:
+    """
+    Generates a 3D Cones k-space trajectory.
+    In this version, all cone apices are at the k-space origin, and their axes align with kz.
+    Cones are interleaved by shifting the starting azimuthal angle of the spiral on the cone surface.
+
+    Args:
+        num_cones (int): Total number of cones (interleaves).
+        num_samples_per_cone (int): Number of k-space samples along each cone's spiral path.
+        max_k_rad_per_m (float): Maximum k-space radius (length of the cone from apex to base edge).
+        cone_angle_deg (float): The half-angle of the cone in degrees 
+                                (angle between cone axis and cone surface).
+        revolutions_per_cone (float): Number of revolutions the spiral makes on the cone surface 
+                                      from apex to base. Defaults to 5.0.
+        central_density_factor (float): Factor to modulate sampling density along the cone axis. 
+                                        (Not implemented in this version, uses uniform density).
+        distribute_cones_method (str): Method to distribute cone axes. 
+                                       Currently only "sequential_uniform_phi" is implemented,
+                                       which interleaves spirals on cones aligned with kz.
+        name (str): Name for the trajectory.
+        dt_seconds (float): Dwell time.
+
+    Returns:
+        Trajectory: The generated 3D Cones trajectory.
+    """
+
+    if not all(isinstance(arg, int) and arg > 0 for arg in [num_cones, num_samples_per_cone]):
+        raise ValueError("num_cones and num_samples_per_cone must be positive integers.")
+    if not (max_k_rad_per_m > 0):
+        raise ValueError("max_k_rad_per_m must be positive.")
+    if not (0 < cone_angle_deg < 90): # Cone angle should be between 0 and 90 (exclusive)
+        raise ValueError("cone_angle_deg must be between 0 and 90 degrees (exclusive).")
+    if revolutions_per_cone <= 0:
+        raise ValueError("revolutions_per_cone must be positive.")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be positive.")
+
+    if distribute_cones_method != "sequential_uniform_phi":
+        raise NotImplementedError(f"Distribution method '{distribute_cones_method}' is not yet implemented. "
+                                  "Only 'sequential_uniform_phi' is supported.")
+    
+    if central_density_factor != 1.0:
+        print(f"Warning: central_density_factor ({central_density_factor}) is not yet implemented. Using uniform density.")
+
+
+    cone_angle_rad = np.deg2rad(cone_angle_deg)
+    all_k_points_list = []
+
+    for i_cone in range(num_cones):
+        # For "sequential_uniform_phi", all cones share the z-axis. Interleaving is by phi_offset_spiral.
+        phi_offset_spiral = i_cone * (2 * np.pi / num_cones)
+        
+        cone_k_points = np.zeros((3, num_samples_per_cone)) # Store as (3, N)
+
+        for j_sample in range(num_samples_per_cone):
+            if num_samples_per_cone == 1:
+                t = 1.0 # Place single point at the end of the cone generator
+            else:
+                t = j_sample / (num_samples_per_cone - 1) # Normalized path length [0, 1]
+
+            # k_abs is distance from apex along the cone surface (generator)
+            k_abs = t * max_k_rad_per_m 
+            # TODO: Implement central_density_factor modulation if needed:
+            # k_abs = (t**central_density_factor) * max_k_rad_per_m
+
+            # Radius of the spiral's projection on the xy plane at this height/distance
+            r_spiral_xy = k_abs * np.sin(cone_angle_rad)
+            
+            # Z-coordinate for this point
+            kz = k_abs * np.cos(cone_angle_rad)
+            
+            # Angle for the spiral on the unfolded cone surface, projected onto xy
+            phi_spiral = phi_offset_spiral + revolutions_per_cone * 2 * np.pi * t
+            
+            kx = r_spiral_xy * np.cos(phi_spiral)
+            ky = r_spiral_xy * np.sin(phi_spiral)
+            
+            cone_k_points[0, j_sample] = kx
+            cone_k_points[1, j_sample] = ky
+            cone_k_points[2, j_sample] = kz
+            
+        all_k_points_list.append(cone_k_points)
+
+    k_space_points_3DN = np.concatenate(all_k_points_list, axis=1)
+
+    metadata = {
+        'generator_params': {
+            'traj_type': '3d_cones',
+            'num_cones': num_cones,
+            'num_samples_per_cone': num_samples_per_cone,
+            'max_k_rad_per_m': max_k_rad_per_m,
+            'cone_angle_deg': cone_angle_deg,
+            'revolutions_per_cone': revolutions_per_cone,
+            'central_density_factor_input': central_density_factor,
+            'distribute_cones_method': distribute_cones_method,
+            'dt_seconds_input': dt_seconds
+        },
+        'interleaf_structure': (num_cones, num_samples_per_cone),
+        'kx_shape': (num_cones, num_samples_per_cone) # Alias for plotting if needed
+    }
+
+    return Trajectory(
+        name=name,
+        kspace_points_rad_per_m=k_space_points_3DN,
+        dt_seconds=dt_seconds,
+        metadata=metadata
+    )
+
+
+def generate_stack_of_spirals_trajectory(
+    num_spirals_per_plane: int, 
+    num_samples_per_spiral: int, 
+    num_planes: int, 
+    plane_fov_m: float, 
+    plane_separation_m: Optional[float] = None, 
+    total_z_fov_m: Optional[float] = None, 
+    max_k_xy_rad_per_m: Optional[float] = None, 
+    max_k_z_rad_per_m: Optional[float] = None, 
+    spiral_revolutions: Optional[float] = 10.0, 
+    center_k_z_zero: bool = True, 
+    name: str = "stack_of_spirals", 
+    dt_seconds: float = 4e-6
+) -> Trajectory:
+    """
+    Generates a 3D Stack-of-Spirals k-space trajectory.
+
+    Args:
+        num_spirals_per_plane (int): Number of spiral arms/interleaves in each xy-plane.
+        num_samples_per_spiral (int): Number of k-space samples per individual spiral arm.
+        num_planes (int): Number of planes (slices) along the kz direction.
+        plane_fov_m (float): Field of view in meters for each xy-plane.
+        plane_separation_m (Optional[float]): Separation between centers of adjacent kz planes (m).
+                                              Used if total_z_fov_m and max_k_z_rad_per_m are None.
+        total_z_fov_m (Optional[float]): Total field of view along the z-axis (m).
+                                         Used if max_k_z_rad_per_m is None.
+        max_k_xy_rad_per_m (Optional[float]): Max k-space radius in xy-plane (rad/m). 
+                                              Defaults to pi / plane_fov_m.
+        max_k_z_rad_per_m (Optional[float]): One-sided max k-space extent along kz (rad/m) if centered,
+                                             or total extent if not centered and starting from 0.
+                                             If None, derived from total_z_fov_m or plane_separation_m.
+        spiral_revolutions (Optional[float]): Revolutions for each 2D spiral. Defaults to 10.0.
+        center_k_z_zero (bool): If True, stack is centered at kz=0. Else, starts from kz=0.
+        name (str): Name for the trajectory.
+        dt_seconds (float): Dwell time.
+
+    Returns:
+        Trajectory: The generated 3D Stack-of-Spirals trajectory.
+    """
+
+    # Validate inputs
+    if not all(isinstance(arg, int) and arg > 0 for arg in [num_spirals_per_plane, num_samples_per_spiral, num_planes]):
+        raise ValueError("Number of spirals, samples, and planes must be positive integers.")
+    if not (plane_fov_m > 0):
+        raise ValueError("plane_fov_m must be positive.")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be positive.")
+    if num_planes < 1:
+        raise ValueError("num_planes must be at least 1.")
+
+    # Determine k_max_xy for the 2D spirals
+    k_max_xy = max_k_xy_rad_per_m if max_k_xy_rad_per_m is not None else (np.pi / plane_fov_m)
+
+    # Determine kz plane positions
+    actual_kz_half_extent = 0.0 # This will be the one-sided extent if centered, or half of total span if not centered from 0
+    
+    if num_planes > 1:
+        if max_k_z_rad_per_m is not None:
+            actual_kz_half_extent = max_k_z_rad_per_m # User provides the one-sided max extent
+        elif total_z_fov_m is not None:
+            if total_z_fov_m <= 0: raise ValueError("total_z_fov_m must be positive.")
+            # k-space extent to resolve total_z_fov_m by Nyquist is +/- pi/total_z_fov_m
+            actual_kz_half_extent = np.pi / total_z_fov_m
+        elif plane_separation_m is not None:
+            if plane_separation_m <= 0: raise ValueError("plane_separation_m must be positive.")
+            # Effective total FOV covered by the stack of planes
+            effective_total_z_coverage_m = plane_separation_m * (num_planes -1) if num_planes > 1 else plane_separation_m
+            if effective_total_z_coverage_m == 0 and num_planes > 1 : # e.g. num_planes=1 or plane_separation=0 and num_planes > 1 (unlikely)
+                 actual_kz_half_extent = 0.0 # All planes effectively at same kz if separation is 0
+            elif effective_total_z_coverage_m > 0 :
+                 # The k-space step corresponding to the spacing between the centers of the outermost planes
+                 # This interpretation: max_kz is half the total k-space span defined by the outermost planes
+                 actual_kz_half_extent = np.pi / plane_separation_m / 2.0 * (num_planes-1) / num_planes *2 # Incorrect
+                 # Correct: distance between outermost planes is (num_planes-1)*plane_separation_m
+                 # The k-space extent needed to resolve this is pi / ((num_planes-1)*plane_separation_m) if that's the smallest feature.
+                 # A more common interpretation: plane_separation_m is like slice thickness for contiguous slices.
+                 # The k-space step (delta_kz) between planes is then related to 1/TotalZ_FOV.
+                 # Total FOV = num_planes * plane_separation_m.
+                 # delta_kz_step = (2 * np.pi) / (num_planes * plane_separation_m)
+                 # actual_kz_half_extent = (num_planes - 1) / 2.0 * delta_kz_step
+                 # This is the most standard interpretation for stack-of-stars/spirals.
+                 delta_kz_step = (2 * np.pi) / (num_planes * plane_separation_m) # k-space FOV / num_planes
+                 actual_kz_half_extent = (num_planes - 1) / 2.0 * delta_kz_step
+
+            else: # plane_separation_m is zero
+                 actual_kz_half_extent = 0.0
+        else:
+            print("Warning: num_planes > 1 but no z-dimension extent (max_k_z, total_z_fov, or plane_separation) provided. All planes will be at kz=0.")
+            actual_kz_half_extent = 0.0
+    
+    # Calculate kz_plane_positions
+    if num_planes == 1:
+        kz_plane_positions = np.array([0.0])
+    else:
+        if center_k_z_zero:
+            kz_plane_positions = np.linspace(-actual_kz_half_extent, actual_kz_half_extent, num_planes)
+        else:
+            # Stack starts at kz=0 and extends. actual_kz_half_extent is half of total span.
+            # So, linspace from 0 to 2 * actual_kz_half_extent.
+            kz_plane_positions = np.linspace(0, 2 * actual_kz_half_extent, num_planes)
+            if actual_kz_half_extent == 0: # If no z-extent defined, all planes are at 0
+                kz_plane_positions = np.zeros(num_planes)
+
+
+    all_k_points_list = []
+    for i_plane, current_kz in enumerate(kz_plane_positions):
+        spiral_traj_2d = generate_spiral_trajectory(
+            num_arms=num_spirals_per_plane,
+            num_samples_per_arm=num_samples_per_spiral,
+            fov_m=plane_fov_m,
+            max_k_rad_per_m=k_max_xy,
+            num_revolutions=spiral_revolutions,
+            dt_seconds=dt_seconds,
+            name=f"spiral_plane_{i_plane}" 
+        )
+        
+        xy_points_DN = spiral_traj_2d.kspace_points_rad_per_m
+        
+        if xy_points_DN.shape[0] != 2:
+            raise ValueError(f"Expected 2D points (2,N) from generate_spiral_trajectory, got shape {xy_points_DN.shape}")
+
+        num_points_in_plane = xy_points_DN.shape[1]
+        kz_coords_N = np.full(num_points_in_plane, current_kz)
+        
+        plane_3d_points_DN = np.vstack((xy_points_DN, kz_coords_N))
+        all_k_points_list.append(plane_3d_points_DN)
+
+    k_space_points_3DN = np.concatenate(all_k_points_list, axis=1)
+
+    metadata = {
+        'generator_params': {
+            'traj_type': 'stack_of_spirals',
+            'num_spirals_per_plane': num_spirals_per_plane,
+            'num_samples_per_spiral': num_samples_per_spiral,
+            'num_planes': num_planes,
+            'plane_fov_m': plane_fov_m,
+            'plane_separation_m_input': plane_separation_m,
+            'total_z_fov_m_input': total_z_fov_m,
+            'max_k_xy_rad_per_m_input': max_k_xy_rad_per_m,
+            'max_k_z_rad_per_m_input': max_k_z_rad_per_m,
+            'k_max_xy_calculated': k_max_xy,
+            'actual_kz_half_extent_calculated': actual_kz_half_extent, # Renamed for clarity
+            'kz_plane_positions_calculated': kz_plane_positions.tolist(),
+            'spiral_revolutions_input': spiral_revolutions,
+            'center_k_z_zero_input': center_k_z_zero,
+            'dt_seconds_input': dt_seconds
+        },
+        'interleaf_structure': (num_planes * num_spirals_per_plane, num_samples_per_spiral),
+        'kx_shape': (num_planes * num_spirals_per_plane, num_samples_per_spiral) 
+    }
+
+    return Trajectory(
+        name=name,
+        kspace_points_rad_per_m=k_space_points_3DN,
+        dt_seconds=dt_seconds,
+        metadata=metadata
+    )
+
+
+def generate_stack_of_spirals_trajectory(
+    num_spirals_per_plane: int, 
+    num_samples_per_spiral: int, 
+    num_planes: int, 
+    plane_fov_m: float, 
+    plane_separation_m: Optional[float] = None, 
+    total_z_fov_m: Optional[float] = None, 
+    max_k_xy_rad_per_m: Optional[float] = None, 
+    max_k_z_rad_per_m: Optional[float] = None, 
+    spiral_revolutions: Optional[float] = 10.0, 
+    center_k_z_zero: bool = True, 
+    name: str = "stack_of_spirals", 
+    dt_seconds: float = 4e-6
+) -> Trajectory:
+    """
+    Generates a 3D Stack-of-Spirals k-space trajectory.
+
+    Args:
+        num_spirals_per_plane (int): Number of spiral arms/interleaves in each xy-plane.
+        num_samples_per_spiral (int): Number of k-space samples per individual spiral arm.
+        num_planes (int): Number of planes (slices) along the kz direction.
+        plane_fov_m (float): Field of view in meters for each xy-plane.
+        plane_separation_m (Optional[float]): Separation between centers of adjacent kz planes (m).
+                                              Used if total_z_fov_m and max_k_z_rad_per_m are None.
+        total_z_fov_m (Optional[float]): Total field of view along the z-axis (m).
+                                         Used if max_k_z_rad_per_m is None.
+        max_k_xy_rad_per_m (Optional[float]): Max k-space radius in xy-plane (rad/m). 
+                                              Defaults to pi / plane_fov_m.
+        max_k_z_rad_per_m (Optional[float]): One-sided max k-space extent along kz (rad/m).
+                                             If None, derived from total_z_fov_m or plane_separation_m.
+        spiral_revolutions (Optional[float]): Revolutions for each 2D spiral. Defaults to 10.0.
+        center_k_z_zero (bool): If True, stack is centered at kz=0. Else, starts from kz=0.
+        name (str): Name for the trajectory.
+        dt_seconds (float): Dwell time.
+
+    Returns:
+        Trajectory: The generated 3D Stack-of-Spirals trajectory.
+    """
+
+    # Validate inputs
+    if not all(isinstance(arg, int) and arg > 0 for arg in [num_spirals_per_plane, num_samples_per_spiral, num_planes]):
+        raise ValueError("Number of spirals, samples, and planes must be positive integers.")
+    if not (plane_fov_m > 0):
+        raise ValueError("plane_fov_m must be positive.")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be positive.")
+
+    # Determine k_max_xy for the 2D spirals
+    k_max_xy = max_k_xy_rad_per_m if max_k_xy_rad_per_m is not None else (np.pi / plane_fov_m)
+
+    # Determine kz plane positions
+    actual_one_sided_max_kz = 0.0
+    if num_planes > 1:
+        if max_k_z_rad_per_m is not None:
+            actual_one_sided_max_kz = max_k_z_rad_per_m
+        elif total_z_fov_m is not None:
+            if total_z_fov_m <= 0: raise ValueError("total_z_fov_m must be positive.")
+            # This interpretation: total_z_fov_m defines the full extent to be resolved by Nyquist.
+            # So, the k-space coverage should span +/- pi / total_z_fov_m.
+            actual_one_sided_max_kz = np.pi / total_z_fov_m
+        elif plane_separation_m is not None:
+            if plane_separation_m <= 0: raise ValueError("plane_separation_m must be positive.")
+            # If plane_separation_m is given, the total extent is (num_planes-1)*plane_separation_m
+            # The k-space step corresponding to resolving this separation is roughly pi/plane_separation_m
+            # The total one-sided k-space extent for the stack:
+            effective_total_z_fov = plane_separation_m * num_planes 
+            # This might be more like: actual_one_sided_max_kz = ((num_planes - 1) / 2.0) * (np.pi / plane_separation_m)
+            # Or, if plane_separation is the slice thickness, then kz_max = pi / slice_thickness for one slice.
+            # For a stack, if separation is between centers, then kz_max is (N-1)/2 * delta_kz_step.
+            # delta_kz_step from total FOV: (2 * pi / (num_planes * plane_separation_m))
+            # This definition is a bit ambiguous. Let's use a common one:
+            # The k-space step related to plane_separation_m (slice thickness) is pi / plane_separation_m.
+            # So, the planes are placed at multiples of this step or related quantity.
+            # Let's assume plane_separation_m is the distance between centers of slices.
+            # The k-space step (delta_kz) that would correspond to a total FOV of (num_planes * plane_separation_m)
+            # is 2*pi / (num_planes * plane_separation_m).
+            # Then actual_one_sided_max_kz = (num_planes - 1) / 2.0 * (2*np.pi / (num_planes * plane_separation_m))
+            # This simplifies to actual_one_sided_max_kz = (num_planes - 1) * np.pi / (num_planes * plane_separation_m)
+            # A more standard interpretation for stack-of-stars:
+            # kz positions are - (N_planes-1)/2 * d_kz, ..., 0, ..., (N_planes-1)/2 * d_kz
+            # where d_kz = 2*pi / TotalZ_FOV. If TotalZ_FOV = num_planes * plane_separation_m
+            # d_kz = 2*pi / (num_planes * plane_separation_m)
+            # actual_one_sided_max_kz = (num_planes - 1)/2 * d_kz
+            delta_kz_step = (2 * np.pi) / (num_planes * plane_separation_m)
+            actual_one_sided_max_kz = (num_planes - 1) / 2.0 * delta_kz_step
+
+        else: # Default to 0 if no z-dimension info for num_planes > 1
+            actual_one_sided_max_kz = 0.0
+            if num_planes > 1:
+                 print("Warning: num_planes > 1 but no z-dimension extent (max_k_z, total_z_fov, or plane_separation) provided. All planes at kz=0.")
+
+
+    if num_planes == 1:
+        kz_plane_positions = np.array([0.0])
+    else:
+        if center_k_z_zero:
+            kz_plane_positions = np.linspace(-actual_one_sided_max_kz, actual_one_sided_max_kz, num_planes)
+        else:
+            # Stack starts at kz=0 and extends. actual_one_sided_max_kz is treated as half of total span.
+            kz_plane_positions = np.linspace(0, 2 * actual_one_sided_max_kz, num_planes)
+            # If actual_one_sided_max_kz was 0, this still results in all zeros, which is fine.
+
+    all_k_points_list = []
+    for current_kz in kz_plane_positions:
+        # Generate 2D spiral for the current plane
+        spiral_traj_2d = generate_spiral_trajectory(
+            num_arms=num_spirals_per_plane,
+            num_samples_per_arm=num_samples_per_spiral,
+            fov_m=plane_fov_m,
+            max_k_rad_per_m=k_max_xy,
+            num_revolutions=spiral_revolutions,
+            dt_seconds=dt_seconds, # Pass dt_seconds to ensure consistency
+            name=f"spiral_plane_kz_{current_kz:.2f}" 
+        )
+        
+        xy_points_DN = spiral_traj_2d.kspace_points_rad_per_m # Should be (2, N_plane_points)
+        
+        # Ensure correct shape
+        if xy_points_DN.shape[0] != 2:
+            # This should not happen if generate_spiral_trajectory is correct
+            raise ValueError(f"Expected 2D points from generate_spiral_trajectory, got shape {xy_points_DN.shape}")
+
+        num_points_in_plane = xy_points_DN.shape[1]
+        kz_coords_N = np.full(num_points_in_plane, current_kz)
+        
+        plane_3d_points_DN = np.vstack((xy_points_DN, kz_coords_N))
+        all_k_points_list.append(plane_3d_points_DN)
+
+    k_space_points_3DN = np.concatenate(all_k_points_list, axis=1)
+
+    total_num_points = k_space_points_3DN.shape[1]
+    # Interleaf structure for metadata: treat each plane's set of spirals as a block
+    # Total "shots" or "interleaves" in the 3D sense would be num_planes * num_spirals_per_plane
+    # Each of these "3D interleaves" has num_samples_per_spiral points.
+    metadata = {
+        'generator_params': {
+            'traj_type': 'stack_of_spirals',
+            'num_spirals_per_plane': num_spirals_per_plane,
+            'num_samples_per_spiral': num_samples_per_spiral,
+            'num_planes': num_planes,
+            'plane_fov_m': plane_fov_m,
+            'plane_separation_m_input': plane_separation_m,
+            'total_z_fov_m_input': total_z_fov_m,
+            'max_k_xy_rad_per_m_input': max_k_xy_rad_per_m,
+            'max_k_z_rad_per_m_input': max_k_z_rad_per_m,
+            'k_max_xy_calculated': k_max_xy,
+            'actual_one_sided_max_kz_calculated': actual_one_sided_max_kz,
+            'kz_plane_positions': kz_plane_positions.tolist(),
+            'spiral_revolutions': spiral_revolutions,
+            'center_k_z_zero': center_k_z_zero,
+            'dt_seconds_input': dt_seconds
+        },
+        # This represents the structure if viewed as (num_planes * num_spirals_per_plane) total 3D "arms",
+        # each with num_samples_per_spiral points.
+        'interleaf_structure': (num_planes * num_spirals_per_plane, num_samples_per_spiral),
+        'kx_shape': (num_planes * num_spirals_per_plane, num_samples_per_spiral) # Alias for plotting
+    }
+
+    return Trajectory(
+        name=name,
+        kspace_points_rad_per_m=k_space_points_3DN,
+        dt_seconds=dt_seconds,
+        metadata=metadata
+    )
 >>>>>>> REPLACE

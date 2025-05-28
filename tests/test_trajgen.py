@@ -1149,6 +1149,154 @@ class TestAdvancedTrajectoryTools(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plot_type must be '2D' or '3D'"):
             display_trajectory(self.simple_2d_traj_obj, plot_type="invalid_plot_type_str")
 
+    # 9. generate_stack_of_spirals_trajectory tests
+    def test_generate_stack_of_spirals(self):
+        num_spirals = 4
+        num_samples = 100
+        num_planes = 3
+        plane_fov = 0.2
+        total_z_fov = 0.1 # Corresponds to max_k_z = pi / 0.1 = 10*pi ~ 31.4
+        
+        traj = generate_stack_of_spirals_trajectory(
+            num_spirals_per_plane=num_spirals,
+            num_samples_per_spiral=num_samples,
+            num_planes=num_planes,
+            plane_fov_m=plane_fov,
+            total_z_fov_m=total_z_fov,
+            dt_seconds=self.dt_s
+        )
+        self.assertIsInstance(traj, Trajectory)
+        self.assertEqual(traj.get_num_dimensions(), 3)
+        self.assertEqual(traj.get_num_points(), num_spirals * num_samples * num_planes)
+        
+        meta_params = traj.metadata['generator_params']
+        self.assertEqual(meta_params['num_planes'], num_planes)
+        
+        kz_values = traj.kspace_points_rad_per_m[2,:]
+        unique_kz = np.unique(np.round(kz_values, decimals=5)) # Round to avoid float precision issues
+        self.assertEqual(len(unique_kz), num_planes, f"Expected {num_planes} unique kz planes, got {len(unique_kz)}: {unique_kz}")
+
+        # Check kz positions based on total_z_fov_m and centered=True (default)
+        expected_max_kz = np.pi / total_z_fov
+        expected_kz_planes = np.linspace(-expected_max_kz, expected_max_kz, num_planes)
+        self.assertTrue(np.allclose(unique_kz, np.round(expected_kz_planes, decimals=5)),
+                        f"Kz planes {unique_kz} do not match expected {expected_kz_planes}")
+
+        # Check XY k_max
+        kxy_points = traj.kspace_points_rad_per_m[:2,:]
+        kxy_radii = np.sqrt(kxy_points[0,:]**2 + kxy_points[1,:]**2)
+        expected_k_max_xy = np.pi / plane_fov
+        self.assertTrue(np.max(kxy_radii) <= expected_k_max_xy * 1.001)
+
+    def test_generate_stack_of_spirals_single_plane(self):
+        traj = generate_stack_of_spirals_trajectory(
+            num_spirals_per_plane=2, num_samples_per_spiral=50, num_planes=1, plane_fov_m=0.25
+        )
+        self.assertEqual(traj.get_num_dimensions(), 3)
+        self.assertEqual(traj.get_num_points(), 2 * 50 * 1)
+        kz_values = traj.kspace_points_rad_per_m[2,:]
+        self.assertTrue(np.allclose(kz_values, 0.0))
+        self.assertEqual(len(np.unique(kz_values)), 1)
+        self.assertEqual(traj.metadata['generator_params']['kz_plane_positions_calculated'], [0.0])
+
+    def test_generate_stack_of_spirals_not_centered(self):
+        num_planes = 4
+        total_z_fov = 0.12
+        traj = generate_stack_of_spirals_trajectory(
+            num_spirals_per_plane=2, num_samples_per_spiral=50, num_planes=num_planes, 
+            plane_fov_m=0.2, total_z_fov_m=total_z_fov, center_k_z_zero=False
+        )
+        expected_max_kz_one_sided = np.pi / total_z_fov
+        expected_kz_planes = np.linspace(0, 2 * expected_max_kz_one_sided, num_planes)
+        
+        kz_values = traj.kspace_points_rad_per_m[2,:]
+        unique_kz = np.unique(np.round(kz_values, decimals=5))
+        self.assertTrue(np.allclose(unique_kz, np.round(expected_kz_planes, decimals=5)),
+                        f"Kz planes {unique_kz} (not centered) do not match expected {expected_kz_planes}")
+
+
+    # 10. generate_3d_cones_trajectory tests
+    def test_generate_3d_cones_trajectory(self):
+        num_cones = 4
+        num_samples = 100
+        max_k = 150.0
+        cone_angle_deg = 20.0
+        
+        traj = generate_3d_cones_trajectory(
+            num_cones=num_cones, 
+            num_samples_per_cone=num_samples,
+            max_k_rad_per_m=max_k,
+            cone_angle_deg=cone_angle_deg,
+            dt_seconds=self.dt_s
+        )
+        self.assertIsInstance(traj, Trajectory)
+        self.assertEqual(traj.get_num_dimensions(), 3)
+        self.assertEqual(traj.get_num_points(), num_cones * num_samples)
+        
+        meta_params = traj.metadata['generator_params']
+        self.assertEqual(meta_params['num_cones'], num_cones)
+        self.assertEqual(meta_params['cone_angle_deg'], cone_angle_deg)
+
+        k_points = traj.kspace_points_rad_per_m # (3, N)
+        kx, ky, kz = k_points[0,:], k_points[1,:], k_points[2,:]
+        
+        # Verify points lie on cones
+        # arctan2(sqrt(kx^2+ky^2), kz) should be cone_angle_rad
+        # Avoid division by zero or issues at apex for kz=0 if cone_angle_deg is 90 (not allowed by check)
+        # For points not exactly at apex (where kz might be 0 if cone_angle_rad is pi/2)
+        valid_indices = np.abs(kz) > 1e-9 # Exclude points very close to or at xy-plane if kz is small
+        if np.any(valid_indices):
+            calculated_cone_angles_rad = np.arctan2(np.sqrt(kx[valid_indices]**2 + ky[valid_indices]**2), kz[valid_indices])
+            # For cones pointing along +z, angle should be positive. If some point to -z, it could be negative.
+            # The current implementation has all cones opening towards +z or -z based on cos(cone_angle_rad).
+            # As kz = k_abs * cos(cone_angle_rad), and k_abs > 0, cone_angle_rad in (0, pi/2), kz is positive.
+            self.assertTrue(np.allclose(np.abs(calculated_cone_angles_rad), np.deg2rad(cone_angle_deg), atol=1e-5),
+                            "Points do not lie on cone surface based on angle.")
+
+        # Check max radius
+        radii_k_abs = np.sqrt(kx**2 + ky**2 + kz**2)
+        self.assertTrue(np.max(radii_k_abs) <= max_k * 1.001, "Points exceed max_k_rad_per_m.")
+
+    def test_generate_3d_cones_invalid_params(self):
+        with self.assertRaises(ValueError): # Invalid cone angle
+            generate_3d_cones_trajectory(1,10,100, cone_angle_deg=90)
+        with self.assertRaises(ValueError): # Invalid cone angle
+            generate_3d_cones_trajectory(1,10,100, cone_angle_deg=0)
+        with self.assertRaises(NotImplementedError): # Invalid method
+            generate_3d_cones_trajectory(1,10,100, 20, distribute_cones_method="invalid_method")
+
+    # 11. constrain_trajectory with 3D
+    def test_constrain_trajectory_3d(self):
+        # Use a 3D trajectory (e.g., stack of spirals)
+        sos_traj = generate_stack_of_spirals_trajectory(
+            num_spirals_per_plane=2, num_samples_per_spiral=50, num_planes=2,
+            plane_fov_m=0.1, total_z_fov_m=0.05, dt_seconds=self.dt_s/10 # Make dt smaller to force violations
+        )
+        
+        max_grad = 0.03
+        max_slew = 120
+        
+        constrained_3d_traj = constrain_trajectory(sos_traj, max_grad, max_slew)
+        self.assertIsInstance(constrained_3d_traj, Trajectory)
+        self.assertEqual(constrained_3d_traj.get_num_dimensions(), 3)
+        self.assertEqual(constrained_3d_traj.get_num_points(), sos_traj.get_num_points())
+        
+        if sos_traj.get_num_points() > 1:
+            self.assertFalse(np.allclose(sos_traj.kspace_points_rad_per_m, 
+                                         constrained_3d_traj.kspace_points_rad_per_m),
+                             "3D Constrained k-space is identical to original.")
+        
+        # Check that the actual max grad/slew are within limits (approx)
+        # These are calculated by Trajectory on its own data.
+        # Allow some tolerance due to discrete differentiation differences.
+        # The constrainer uses forward/backward differences, Trajectory uses np.gradient.
+        # Max grad from Trajectory might be slightly higher due to np.gradient behavior at edges.
+        # A better check is that the *intended* change was limited.
+        self.assertTrue(constrained_3d_traj.get_max_grad_Tm() <= max_grad * 1.05, # Allow 5% tolerance
+                        f"Constrained max grad {constrained_3d_traj.get_max_grad_Tm()} > limit {max_grad}")
+        self.assertTrue(constrained_3d_traj.get_max_slew_Tm_per_s() <= max_slew * 1.05, # Allow 5% tolerance
+                        f"Constrained max slew {constrained_3d_traj.get_max_slew_Tm_per_s()} > limit {max_slew}")
+
 
 if __name__ == '__main__':
     unittest.main()
