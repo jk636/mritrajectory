@@ -1,5 +1,8 @@
 import numpy as np
 from typing import Callable, Optional, Dict, Any
+from scipy.spatial import Voronoi, ConvexHull
+from scipy.spatial.qhull import QhullError
+
 
 import numpy as np
 
@@ -10,44 +13,140 @@ class Trajectory:
     Container for a k-space trajectory and associated data.
     Includes additional trajectory metrics like max PNS, max slew, FOV, and resolution.
     """
-    def __init__(self, name, kspace_points_rad_per_m, gradient_waveforms_Tm=None, dt_seconds=None, metadata=None):
+    def __init__(self, name, kspace_points_rad_per_m, 
+                 gradient_waveforms_Tm=None, dt_seconds=None, 
+                 metadata=None, gamma_Hz_per_T=42.576e6,
+                 dead_time_start_seconds=0.0, dead_time_end_seconds=0.0):
         """
         Args:
             name (str): Trajectory name/description.
             kspace_points_rad_per_m (np.ndarray): [D, N] or [N, D] k-space coordinates in rad/m.
             gradient_waveforms_Tm (np.ndarray, optional): [D, N] or [N, D] gradient waveforms in T/m.
-            dt_seconds (float, optional): Dwell/sample time in seconds.
+                                                         If None, will be computed on demand.
+            dt_seconds (float, optional): Dwell/sample time in seconds. Required if gradients are to be computed.
             metadata (dict, optional): Additional information.
+            gamma_Hz_per_T (float, optional): Gyromagnetic ratio. Defaults to 42.576e6 Hz/T (for protons).
+            dead_time_start_seconds (float, optional): Dead time at the beginning of the trajectory. Defaults to 0.0.
+            dead_time_end_seconds (float, optional): Dead time at the end of the trajectory. Defaults to 0.0.
         """
         self.name = name
         self.kspace_points_rad_per_m = np.array(kspace_points_rad_per_m)
+        # gradient_waveforms_Tm now acts as a cache: initially stores provided gradients,
+        # or None if not provided, to be computed later by get_gradient_waveforms_Tm()
+        # Use self.gradient_waveforms_Tm as the cache. Initialize with provided gradients or None.
         self.gradient_waveforms_Tm = np.array(gradient_waveforms_Tm) if gradient_waveforms_Tm is not None else None
         self.dt_seconds = dt_seconds
         self.metadata = metadata or {}
+        
+        # Store dead times as attributes
+        self.dead_time_start_seconds = dead_time_start_seconds
+        self.dead_time_end_seconds = dead_time_end_seconds
 
-        # Automatically populate additional metrics
-        self._compute_metrics()
+        # Prioritize gamma from metadata if it exists (e.g. from file import), else use provided or default.
+        if 'gamma_Hz_per_T' not in self.metadata:
+             self.metadata['gamma_Hz_per_T'] = gamma_Hz_per_T
+        
+        self._update_dead_time_metadata() # Populate metadata with deadtime info
+
+        # Automatically populate additional metrics if possible
+        self._compute_metrics() # This will call slew, pns, fov, resolution which might use dt.
+
+    def _update_dead_time_metadata(self):
+        """Updates metadata with dead time information in seconds and samples."""
+        self.metadata['dead_time_start_seconds'] = self.dead_time_start_seconds
+        self.metadata['dead_time_end_seconds'] = self.dead_time_end_seconds
+
+        if self.dt_seconds is not None and self.dt_seconds > 0:
+            self.dead_time_start_samples = self.dead_time_start_seconds / self.dt_seconds
+            self.dead_time_end_samples = self.dead_time_end_seconds / self.dt_seconds
+            self.metadata['dead_time_start_samples'] = self.dead_time_start_samples
+            self.metadata['dead_time_end_samples'] = self.dead_time_end_samples
+        else:
+            self.dead_time_start_samples = None
+            self.dead_time_end_samples = None
+            self.metadata['dead_time_start_samples'] = None
+            self.metadata['dead_time_end_samples'] = None
+
+    def get_gradient_waveforms_Tm(self) -> Optional[np.ndarray]:
+        """
+        Returns the gradient waveforms in T/m.
+        If not provided at initialization, they are computed from k-space points and dt, then cached.
+        The cached gradients are consistently stored in [D, N] orientation.
+        """
+        if self.gradient_waveforms_Tm is not None: # Check cache first
+            return self.gradient_waveforms_Tm
+
+        if self.dt_seconds is None or self.kspace_points_rad_per_m is None or self.kspace_points_rad_per_m.size == 0:
+            return None
+
+        k_data = np.array(self.kspace_points_rad_per_m)
+        D = self.get_num_dimensions()
+        N = self.get_num_points()
+
+        k_for_gradient = k_data
+        # Ensure k_for_gradient is [D, N] for gradient calculation along axis=-1
+        if k_data.ndim == 2 and k_data.shape[0] == N and k_data.shape[1] == D: # Actual [N, D]
+            if N != 0 and D != 0 : k_for_gradient = k_data.T
+        elif k_data.ndim == 1 and N == k_data.shape[0] and D == 1: # Actual 1D array [N], treat as [1,N]
+            k_for_gradient = k_data.reshape(1, N)
+        elif k_data.ndim == 2 and k_data.shape[0] == D and k_data.shape[1] == N: # Actual [D, N]
+            pass # Already in correct [D,N] orientation
+        elif k_data.ndim == 1 and D == k_data.shape[0] and N == 1: # Actual 1D array [D] representing a single point, treat as [D,1]
+             k_for_gradient = k_data.reshape(D, 1)
+        else:
+            # Fallback or ambiguous shape. If N or D is 0, it might also lead here.
+            # print(f"Warning: Ambiguous k-space data shape {k_data.shape} for gradient computation (D={D}, N={N}).")
+            if N==0 or D==0: # Cannot compute gradient if one dimension is zero.
+                self.gradient_waveforms_Tm = np.array([]).reshape(D,N) # Store empty array of correct shape
+                return self.gradient_waveforms_Tm
+            # If still ambiguous, return None as we cannot safely proceed.
+            return None
+        
+        gamma = self.metadata.get('gamma_Hz_per_T', 42.576e6)
+        if gamma == 0: gamma = 42.576e6 # Avoid division by zero
+
+        computed_gradients = None
+        if k_for_gradient.shape[-1] < 2: # N < 2 (i.e., 0 or 1 point)
+            # For single or zero point trajectories, gradient is zero.
+            computed_gradients = np.zeros_like(k_for_gradient)
+        else:
+            try:
+                computed_gradients = np.gradient(k_for_gradient, self.dt_seconds, axis=-1) / gamma
+            except ValueError as e: # Should be caught by N < 2, but as a safeguard
+                # print(f"Warning: np.gradient failed for shape {k_for_gradient.shape}: {e}")
+                # Attempt to return zeros if k_for_gradient is valid, otherwise re-raise or return None
+                if hasattr(k_for_gradient, 'shape'):
+                    computed_gradients = np.zeros_like(k_for_gradient)
+                else:
+                    return None # Cannot even form zeros.
+            
+        self.gradient_waveforms_Tm = computed_gradients # Cache the result (now always [D,N] or empty)
+        return self.gradient_waveforms_Tm
 
     def _calculate_slew_rate(self):
-        """Calculates slew rate and stores it in metadata."""
-        if self.gradient_waveforms_Tm is not None and self.dt_seconds is not None:
-            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
-            max_slew_rate_Tm_per_s = np.max(np.linalg.norm(slew, axis=0))
+        """Calculates slew rate and stores it in metadata. Assumes gradients are [D,N]."""
+        gradients = self.get_gradient_waveforms_Tm() # Should be [D,N]
+        if gradients is not None and gradients.size > 0 and self.dt_seconds is not None and gradients.shape[-1] > 1: # N > 1
+            slew = np.diff(gradients, axis=-1) / self.dt_seconds # diff along N axis
+            max_slew_rate_Tm_per_s = np.max(np.linalg.norm(slew, axis=0)) # norm over D axis
             self.metadata['max_slew_rate_Tm_per_s'] = max_slew_rate_Tm_per_s
         else:
-            self.metadata['max_slew_rate_Tm_per_s'] = None
+            self.metadata['max_slew_rate_Tm_per_s'] = None if gradients is None else 0.0
+
 
     def _calculate_pns(self):
-        """Calculates PNS metrics and stores them in metadata."""
-        if self.gradient_waveforms_Tm is not None and self.dt_seconds is not None:
-            # PNS_max_abs_gradient_sum_xyz = max(abs(Gx) + abs(Gy) + abs(Gz))
-            abs_grad_sum = np.sum(np.abs(self.gradient_waveforms_Tm), axis=0)
+        """Calculates PNS metrics and stores them in metadata. Assumes gradients are [D,N]."""
+        gradients = self.get_gradient_waveforms_Tm() # Should be [D,N]
+        if gradients is not None and gradients.size > 0 and self.dt_seconds is not None:
+            abs_grad_sum = np.sum(np.abs(gradients), axis=0) # Sum over D axis
             self.metadata['pns_max_abs_gradient_sum_xyz'] = np.max(abs_grad_sum)
 
-            # PNS_max_abs_slew_sum_xyz = max(abs(SlewX) + abs(SlewY) + abs(SlewZ))
-            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
-            abs_slew_sum = np.sum(np.abs(slew), axis=0)
-            self.metadata['pns_max_abs_slew_sum_xyz'] = np.max(abs_slew_sum)
+            if gradients.shape[-1] > 1: # N > 1 for slew calculation
+                slew = np.diff(gradients, axis=-1) / self.dt_seconds # diff along N axis
+                abs_slew_sum = np.sum(np.abs(slew), axis=0) # Sum over D axis
+                self.metadata['pns_max_abs_slew_sum_xyz'] = np.max(abs_slew_sum)
+            else: # Single point, slew is zero.
+                self.metadata['pns_max_abs_slew_sum_xyz'] = 0.0
         else:
             self.metadata['pns_max_abs_gradient_sum_xyz'] = None
             self.metadata['pns_max_abs_slew_sum_xyz'] = None
@@ -105,29 +204,47 @@ class Trajectory:
 
     def _compute_metrics(self):
         """Computes all trajectory metrics."""
+        # self._update_dead_time_metadata() # Already called in __init__ after crucial attrs are set
         self._calculate_slew_rate()
         self._calculate_pns()
         self._calculate_fov()
         self._calculate_resolution()
 
     def get_duration_seconds(self) -> Optional[float]:
-        """Returns total trajectory duration in seconds."""
-        if self.dt_seconds is not None and self.kspace_points_rad_per_m is not None:
-            return self.get_num_points() * self.dt_seconds
-        return None
+        """
+        Returns total trajectory duration in seconds, including dead times.
+        Returns None if dt_seconds is not defined.
+        """
+        if self.dt_seconds is None: # Cannot calculate sampling duration
+            # If there's deadtime but no sampling time, duration is ambiguous.
+            # Return None, or sum of deadtimes if that's meaningful.
+            # For now, if sampling duration is undefined, total duration is undefined.
+            return None
+
+        num_points = self.get_num_points()
+        # If kspace_points_rad_per_m is None or empty, get_num_points() should handle it (e.g. return 0).
+        # If num_points is 0 (e.g. empty kspace), sampling_duration is 0.
+        sampling_duration = num_points * self.dt_seconds
+        
+        total_duration = self.dead_time_start_seconds + sampling_duration + self.dead_time_end_seconds
+        return total_duration
 
     def get_max_grad_Tm(self) -> Optional[float]:
         """Returns the maximum absolute gradient amplitude (T/m)."""
-        if self.gradient_waveforms_Tm is not None:
-            return np.max(np.linalg.norm(self.gradient_waveforms_Tm, axis=0))
+        gradients = self.get_gradient_waveforms_Tm()
+        if gradients is not None:
+            return np.max(np.linalg.norm(gradients, axis=0))
         return None
 
     def get_max_slew_Tm_per_s(self) -> Optional[float]:
         """Returns the maximum absolute slew rate (T/m/s)."""
-        if 'max_slew_rate_Tm_per_s' in self.metadata:
+        # This value is calculated and stored in metadata by _calculate_slew_rate
+        if 'max_slew_rate_Tm_per_s' in self.metadata and self.metadata['max_slew_rate_Tm_per_s'] is not None:
             return self.metadata['max_slew_rate_Tm_per_s']
-        elif self.gradient_waveforms_Tm is not None and self.dt_seconds is not None and self.gradient_waveforms_Tm.shape[-1] > 1:
-            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
+        # Fallback if not in metadata or called before _compute_metrics, try to compute if possible
+        gradients = self.get_gradient_waveforms_Tm()
+        if gradients is not None and self.dt_seconds is not None and gradients.shape[-1] > 1:
+            slew = np.diff(gradients, axis=-1) / self.dt_seconds
             return np.max(np.linalg.norm(slew, axis=0))
         return None
 
@@ -167,20 +284,67 @@ class Trajectory:
             else: # Default to text if extension is unknown or not provided and not one of the above
                 filetype = 'txt'
         
-        # Ensure points are [N, D] for export
-        points_to_export = self.kspace_points_rad_per_m
-        # Heuristic: if first dim is smaller than second AND first dim is <=3, assume it's [D, N]
-        if points_to_export.ndim == 2 and points_to_export.shape[0] < points_to_export.shape[1] and points_to_export.shape[0] <=3 :
-            points_to_export = points_to_export.T
+        # Ensure points are [N, D] for export (unless 1D)
+        points_original_ ήταν_DN = False
+        points_to_export = np.array(self.kspace_points_rad_per_m)
+
+        if points_to_export.ndim == 2:
+            # Heuristic from get_num_dimensions/get_num_points:
+            # If shape[0] is D (<=3 or less than shape[1]), it's [D,N]
+            # This is the check for [D,N] orientation.
+            if (points_to_export.shape[0] <= 3 or points_to_export.shape[0] < points_to_export.shape[1]) and \
+               points_to_export.shape[0] == self.get_num_dimensions() and \
+               points_to_export.shape[1] == self.get_num_points():
+                points_original_ήταν_DN = True
+                points_to_export = points_to_export.T # Export k-space as [N,D]
+
+        # Gradients from getter are always [D,N] (or empty with D,N shape, or None)
+        gradients_from_getter = self.get_gradient_waveforms_Tm()
+        gradients_to_export = gradients_from_getter
+
+        if gradients_from_getter is not None and gradients_from_getter.ndim == 2:
+            if points_original_ήταν_DN:
+                # K-space was [D,N] and was transposed to [N,D] for export.
+                # Gradients (which are [D,N]) must also be transposed to [N,D].
+                gradients_to_export = gradients_from_getter.T
+            else:
+                # K-space was originally [N,D] (or 1D). Gradients from getter are [D,N].
+                # To make gradients [N,D] for export, they need to be transposed.
+                # (This assumes original k-space was [N,D] and gradients are [D,N])
+                if points_to_export.ndim == 2 and \
+                   points_to_export.shape[0] == self.get_num_points() and \
+                   points_to_export.shape[1] == self.get_num_dimensions(): # k-space is N,D
+                     if gradients_from_getter.shape[0] == self.get_num_dimensions() and \
+                        gradients_from_getter.shape[1] == self.get_num_points(): # Gradients are D,N
+                        gradients_to_export = gradients_from_getter.T
+        
+        # For 1D k-space (e.g. [N_points]), points_to_export is [N_points].
+        # gradients_from_getter would be [1, N_points].
+        # gradients_to_export should ideally be [N_points] or [N_points, 1] for consistency if saved.
+        if points_to_export.ndim == 1 and gradients_to_export is not None and gradients_to_export.ndim == 2:
+            if gradients_to_export.shape[0] == 1 : # Gradients are [1, N]
+                gradients_to_export = gradients_to_export.reshape(gradients_to_export.shape[1]) # Make it [N]
+            elif gradients_to_export.shape[1] == 1: # Gradients are [N, 1] (unlikely from getter)
+                gradients_to_export = gradients_to_export.reshape(gradients_to_export.shape[0]) # Make it [N]
+
 
         if filetype == 'csv':
             np.savetxt(filename, points_to_export, delimiter=',')
+            # Consider saving gradients to a separate file if needed for CSV:
+            # if gradients_to_export is not None:
+            #    np.savetxt(filename.replace('.csv', '_grad.csv'), gradients_to_export, delimiter=',')
         elif filetype == 'npy':
+            # Standard practice for .npy is to save the array as is.
+            # For multiple arrays, .npz is better.
+            # If saving both, use npz. If only k-space, this is fine.
             np.save(filename, points_to_export)
         elif filetype == 'npz':
-            np.savez(filename, kspace_points_rad_per_m=points_to_export, 
-                     gradient_waveforms_Tm=self.gradient_waveforms_Tm, 
-                     dt_seconds=self.dt_seconds, metadata=self.metadata)
+            save_dict = {'kspace_points_rad_per_m': points_to_export,
+                         'dt_seconds': self.dt_seconds,
+                         'metadata': self.metadata}
+            if gradients_to_export is not None:
+                save_dict['gradient_waveforms_Tm'] = gradients_to_export
+            np.savez(filename, **save_dict)
         elif filetype == 'txt':
             np.savetxt(filename, points_to_export)
         else:
@@ -217,15 +381,143 @@ class Trajectory:
 
             # Ensure metadata is a dictionary, even if stored as an array by older versions
             metadata_raw = data.get('metadata')
+            metadata_dict = {}
             if metadata_raw is not None:
-                metadata = metadata_raw.item() if hasattr(metadata_raw, 'item') else dict(metadata_raw) if not isinstance(metadata_raw, dict) else metadata_raw
-            else:
-                metadata = {}
-                
-            return cls(name=filename, kspace_points_rad_per_m=points, 
-                       gradient_waveforms_Tm=gradients, dt_seconds=dt, metadata=metadata)
+                try:
+                    # Attempt to convert to dict if it's a structured array or similar
+                    # Check if item() is callable before calling, for some np array types
+                    metadata_dict = metadata_raw.item() if hasattr(metadata_raw, 'item') and callable(metadata_raw.item) else dict(metadata_raw)
+                except (TypeError, AttributeError, ValueError): # Added ValueError for cases like `dict(np.array([1]))`
+                    if isinstance(metadata_raw, dict):
+                        metadata_dict = metadata_raw
+                    else: 
+                        # print(f"Warning: Could not parse metadata from npz, type: {type(metadata_raw)}")
+                        metadata_dict = {'raw_metadata': metadata_raw} if metadata_raw is not None else {}
+            
+            gamma_from_file = metadata_dict.get('gamma_Hz_per_T')
+            dts_s_from_file = metadata_dict.get('dead_time_start_seconds', 0.0)
+            dte_s_from_file = metadata_dict.get('dead_time_end_seconds', 0.0)
+            # Note: dead_time_..._samples will be recalculated in __init__ via _update_dead_time_metadata
+
+            traj_instance = cls(name=filename, kspace_points_rad_per_m=points, 
+                               gradient_waveforms_Tm=gradients, dt_seconds=dt, 
+                               metadata=metadata_dict, 
+                               gamma_Hz_per_T=gamma_from_file if gamma_from_file is not None else 42.576e6,
+                               dead_time_start_seconds=dts_s_from_file,
+                               dead_time_end_seconds=dte_s_from_file)
+            # Instance attributes (dead_time_start_samples etc.) are set by _update_dead_time_metadata in __init__
+            return traj_instance
         else:
             raise ValueError(f"Unsupported filetype or extension for: {filename}")
+
+    def calculate_voronoi_density(self, force_recompute=False, qhull_options=None):
+        """
+        Calculates the Voronoi cell size for each k-space point.
+
+        Args:
+            force_recompute (bool): If True, recalculate even if results are cached.
+            qhull_options (str, optional): Additional Qhull options for Voronoi calculation.
+                                           Defaults to 'Qbb Qc Qz' for 2D/3D.
+
+        Returns:
+            np.ndarray: Array of Voronoi cell sizes (area for 2D, volume for 3D)
+                        corresponding to each k-space point. Values can be np.inf
+                        for unbounded cells or np.nan for calculation errors/degenerate cells.
+                        Returns None if calculation is not possible or fails globally.
+        """
+        if not force_recompute and 'voronoi_cell_sizes' in self.metadata:
+            return self.metadata['voronoi_cell_sizes']
+
+        self.metadata.pop('voronoi_cell_sizes', None) # Clear previous results
+        self.metadata['voronoi_calculation_status'] = "Not Attempted"
+
+        if self.kspace_points_rad_per_m is None or self.kspace_points_rad_per_m.size == 0:
+            self.metadata['voronoi_calculation_status'] = "Error: K-space data is empty or None."
+            return None
+
+        k_data_original = np.array(self.kspace_points_rad_per_m)
+        D = self.get_num_dimensions()
+        N = self.get_num_points()
+
+        # Voronoi expects points as (N, D)
+        points_ND = k_data_original
+        if k_data_original.shape[0] == D and k_data_original.shape[1] == N and D != N : # Check if it's likely D, N and not ambiguous square
+            points_ND = k_data_original.T
+        elif k_data_original.ndim == 1 and D == 1: # Single dimension data [N]
+             points_ND = k_data_original.reshape(-1,1)
+        elif points_ND.shape[0] != N or points_ND.shape[1] != D :
+             # This case might occur if D==N, and the heuristic was ambiguous.
+             # Or if the input shape is truly strange.
+             # Assuming if D==N, the input is already N,D or D,N.
+             # If input is D,N and D==N, transposing is not harmful if already N,D,
+             # but might be wrong if it was truly D,N.
+             # A common convention is N > D. If N==D, Voronoi will run, but interpretation of D,N vs N,D matters.
+             # Let's assume if N==D, points are already (N,D).
+             # If after potential transpose, shape is still not (N,D), then error.
+            if points_ND.shape[0] != N or points_ND.shape[1] != D:
+                 self.metadata['voronoi_calculation_status'] = f"Error: Ambiguous k-space data shape {k_data_original.shape} for (N,D) format. N={N}, D={D}."
+                 return None
+
+
+        if N < D + 1:
+            self.metadata['voronoi_calculation_status'] = f"Error: Not enough points ({N}) for Voronoi in {D}D (need at least {D+1})."
+            return None
+
+        if D not in [2, 3]:
+            self.metadata['voronoi_calculation_status'] = f"Error: Voronoi calculation only supported for 2D/3D (D={D})."
+            return None
+        
+        # Deduplicate points for Voronoi, as it can fail with duplicates
+        # Keep track of original indices to map results back
+        unique_points, unique_indices = np.unique(points_ND, axis=0, return_inverse=True)
+        
+        if unique_points.shape[0] < D + 1:
+            self.metadata['voronoi_calculation_status'] = f"Error: Not enough unique points ({unique_points.shape[0]}) for Voronoi in {D}D."
+            return None
+
+        cell_sizes_unique = np.full(unique_points.shape[0], np.nan)
+
+        try:
+            default_qhull_options = 'Qbb Qc Qz' # Qbb prevents issues with very large coords, Qc keeps coplanar points, Qz handles co-spherical
+            vor = Voronoi(unique_points, qhull_options=qhull_options if qhull_options is not None else default_qhull_options)
+            
+            for i in range(unique_points.shape[0]):
+                region_idx = vor.point_region[i]
+                vertex_indices = vor.regions[region_idx]
+
+                if -1 in vertex_indices or not vertex_indices: # Unbounded or empty region
+                    cell_sizes_unique[i] = np.inf
+                    continue
+
+                region_vertices = vor.vertices[vertex_indices]
+
+                if region_vertices.shape[0] < D + 1: # Not enough vertices for a hull
+                    cell_sizes_unique[i] = 0.0 # Degenerate cell, effectively zero area/volume
+                    continue
+                
+                try:
+                    # QJ can help with precision issues for ConvexHull, especially in 3D
+                    hull_qhull_options = 'QJ' if D > 1 else None # QJ only for 2D+
+                    current_hull = ConvexHull(region_vertices, qhull_options=hull_qhull_options)
+                    cell_sizes_unique[i] = current_hull.volume # .volume is area in 2D, volume in 3D
+                except QhullError: # If ConvexHull fails for a specific region
+                    cell_sizes_unique[i] = np.nan # Mark as error for this cell
+                except Exception: # Other errors during hull calculation
+                    cell_sizes_unique[i] = np.nan
+
+
+            # Map unique cell sizes back to original points
+            cell_sizes = cell_sizes_unique[unique_indices]
+            self.metadata['voronoi_cell_sizes'] = cell_sizes
+            self.metadata['voronoi_calculation_status'] = "Success"
+            return cell_sizes
+
+        except QhullError as e:
+            self.metadata['voronoi_calculation_status'] = f"Error: QhullError during Voronoi: {e}"
+            return None
+        except Exception as e: # Catch any other unexpected errors
+            self.metadata['voronoi_calculation_status'] = f"Error: Unexpected error during Voronoi: {e}"
+            return None
 
     def summary(self):
         """
@@ -240,15 +532,26 @@ class Trajectory:
         print(f"  Number of Points: {num_points}")
         print(f"  Duration: {duration_ms:.2f} ms" if isinstance(duration_ms, float) else f"Duration: {duration_ms}")
         print(f"  Dwell Time (dt): {self.dt_seconds * 1e6:.2f} µs" if self.dt_seconds is not None else "Dwell Time (dt): N/A")
+        print(f"  Gamma: {self.metadata.get('gamma_Hz_per_T', 'N/A'):.2e} Hz/T" if isinstance(self.metadata.get('gamma_Hz_per_T'), (float, int)) else f"  Gamma: {self.metadata.get('gamma_Hz_per_T', 'N/A')}")
 
-        if self.gradient_waveforms_Tm is not None:
+        # Use the getter for gradients to ensure they are computed if needed
+        current_gradients = self.get_gradient_waveforms_Tm()
+        if current_gradients is not None:
             print("\n  Gradients:")
+            # get_max_grad_Tm and get_max_slew_Tm_per_s now use the getter internally
             max_grad_mT_m = self.get_max_grad_Tm() * 1e3 if self.get_max_grad_Tm() is not None else "N/A"
-            max_slew_Tm_s = self.get_max_slew_Tm_per_s() if self.get_max_slew_Tm_per_s() is not None else "N/A"
+            max_slew_Tm_s = self.get_max_slew_Tm_per_s() # Already computed by _compute_metrics
+            max_slew_Tm_s_val = "N/A"
+            if isinstance(max_slew_Tm_s, (float, np.floating)):
+                 max_slew_Tm_s_val = f"{max_slew_Tm_s:.2f} T/m/s"
+            elif max_slew_Tm_s is not None : # if it's a string or other non-float from metadata
+                 max_slew_Tm_s_val = str(max_slew_Tm_s)
+
+
             print(f"    Max Gradient Amplitude: {max_grad_mT_m:.2f} mT/m" if isinstance(max_grad_mT_m, float) else f"    Max Gradient Amplitude: {max_grad_mT_m}")
-            print(f"    Max Slew Rate: {max_slew_Tm_s:.2f} T/m/s" if isinstance(max_slew_Tm_s, float) else f"    Max Slew Rate: {max_slew_Tm_s}")
+            print(f"    Max Slew Rate: {max_slew_Tm_s_val}")
         else:
-            print("\n  Gradients: Not provided.")
+            print("\n  Gradients: Not available or not computed.")
 
         print("\n  Calculated Metrics (from metadata):")
         if not self.metadata:
@@ -286,6 +589,23 @@ class Trajectory:
                         print(f"    {key}: {value:.3f} {unit}")
                 else:
                     print(f"    {key}: {value}")
+        
+        if 'voronoi_calculation_status' in self.metadata:
+            print(f"\n  Voronoi Density Calculation Status: {self.metadata['voronoi_calculation_status']}")
+            if self.metadata['voronoi_calculation_status'] == "Success" and 'voronoi_cell_sizes' in self.metadata:
+                sizes = self.metadata['voronoi_cell_sizes']
+                finite_sizes = sizes[np.isfinite(sizes) & ~np.isnan(sizes)]
+                num_inf = np.sum(np.isinf(sizes))
+                num_nan = np.sum(np.isnan(sizes))
+                print(f"    Voronoi Cell Sizes ({len(sizes)} total):")
+                if finite_sizes.size > 0:
+                    print(f"      Finite Cells ({len(finite_sizes)}): Mean={np.mean(finite_sizes):.2e}, Median={np.median(finite_sizes):.2e}")
+                    print(f"                     Min={np.min(finite_sizes):.2e}, Max={np.max(finite_sizes):.2e}, Std={np.std(finite_sizes):.2e}")
+                if num_inf > 0:
+                    print(f"      Unbounded Cells (np.inf): {num_inf}")
+                if num_nan > 0:
+                    print(f"      Error/Degenerate Cells (np.nan): {num_nan}")
+        
         print("--- End of Summary ---")
         Args:
             filename (str): Output file name.
@@ -306,7 +626,7 @@ class Trajectory:
         elif filetype == 'npy':
             np.save(filename, arr)
         elif filetype == 'npz':
-            np.savez(filename, kspace=arr, gradients=self.gradients, dt=self.dt, metadata=self.metadata)
+            np.savez(filename, kspace=arr, gradients=self.get_gradient_waveforms_Tm(), dt=self.dt, metadata=self.metadata)
         elif filetype == 'txt':
             np.savetxt(filename, arr)
         else:
@@ -339,8 +659,8 @@ class Trajectory:
         """
         d, n = self.points.shape if self.points.shape[0] < self.points.shape[1] else self.points.T.shape
         print(f"Trajectory '{self.name}': {n} points, {d} dimensions")
-        if self.gradients is not None:
-            print("Gradients present.")
+        if self.get_gradient_waveforms_Tm() is not None:
+            print("Gradients available.")
         if self.dt is not None:
             print(f"Sample time: {self.dt * 1e6:.2f} us")
         if self.metadata:
@@ -382,6 +702,13 @@ class KSpaceTrajectoryGenerator:
         vd_rho: Optional[float] = None,
         spiral_out_out: bool = False,          # <--- New option
         spiral_out_out_split: float = 0.5,     # <--- Fraction of samples for first spiral out (0.5=even split)
+        # Parameters for 3D EPI
+        epi_3d_fov_y: Optional[float] = None,
+        epi_3d_resolution_y: Optional[float] = None,
+        epi_3d_fov_z: Optional[float] = None,
+        epi_3d_resolution_z: Optional[float] = None,
+        # UTE ramp sampling
+        ute_ramp_sampling: bool = False,
         ):
         self.fov = fov
         self.resolution = resolution
@@ -411,6 +738,13 @@ class KSpaceTrajectoryGenerator:
         self.vd_rho = vd_rho
         self.spiral_out_out = spiral_out_out
         self.spiral_out_out_split = spiral_out_out_split
+        
+        # Store 3D EPI specific parameters
+        self.epi_3d_fov_y = epi_3d_fov_y
+        self.epi_3d_resolution_y = epi_3d_resolution_y
+        self.epi_3d_fov_z = epi_3d_fov_z
+        self.epi_3d_resolution_z = epi_3d_resolution_z
+        self.ute_ramp_sampling = ute_ramp_sampling
 
         self.k_max = 1 / (2 * self.resolution)
         self.g_required = min(self.k_max / (self.gamma * self.dt), self.g_max)
@@ -426,17 +760,31 @@ class KSpaceTrajectoryGenerator:
 
     def _make_radius_profile(self, n_samples=None):
         n_samples = n_samples or self.n_samples
-        ramp_samples = int(self.ramp_fraction * n_samples)
-        flat_samples = n_samples - 2 * ramp_samples
-        if self.add_slew_limited_ramps:
-            ramp_up = self._slew_limited_ramp(ramp_samples)
-            flat = np.ones(flat_samples)
-            ramp_down = 1 - self._slew_limited_ramp(ramp_samples)
-            r_profile = np.concatenate([ramp_up, flat, ramp_down])
+        
+        if self.ute_ramp_sampling:
+            if self.add_slew_limited_ramps:
+                # Slew-limited ramp from 0 to 1
+                r_profile = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, n_samples)))
+            else:
+                # Linear ramp from 0 to 1
+                r_profile = np.linspace(0, 1, n_samples)
         else:
-            r_profile = np.ones(n_samples)
-            r_profile[:ramp_samples] = np.linspace(0, 1, ramp_samples)
-            r_profile[-ramp_samples:] = np.linspace(1, 0, ramp_samples)
+            # Standard profile with ramp-up, flat-top, ramp-down
+            ramp_samples = int(self.ramp_fraction * n_samples)
+            if ramp_samples * 2 > n_samples : # Ensure ramp_samples are not too large for n_samples
+                ramp_samples = n_samples // 2 
+            flat_samples = n_samples - 2 * ramp_samples
+            
+            if self.add_slew_limited_ramps:
+                ramp_up = self._slew_limited_ramp(ramp_samples)
+                flat = np.ones(flat_samples)
+                ramp_down = 1 - self._slew_limited_ramp(ramp_samples) # This ramps from 1 down to 0
+                r_profile = np.concatenate([ramp_up, flat, ramp_down])
+            else:
+                r_profile = np.ones(n_samples)
+                if ramp_samples > 0: # Avoid issues if n_samples is very small
+                    r_profile[:ramp_samples] = np.linspace(0, 1, ramp_samples)
+                    r_profile[-ramp_samples:] = np.linspace(1, 0, ramp_samples)
         return r_profile
 
     def _variable_density_spiral(self, t):
@@ -569,7 +917,12 @@ class KSpaceTrajectoryGenerator:
             elif self.traj_type == "radial":
                 angle = (self._golden_angle(interleaf_idx) if self.use_golden_angle
                          else np.pi * interleaf_idx / self.n_interleaves)
-                k_line = np.linspace(-k_max, k_max, n_samples) * r_profile
+                if self.ute_ramp_sampling:
+                    # r_profile is 0 to 1, k_max is the max radius
+                    k_line = r_profile * k_max # Half-spoke from 0 to k_max
+                else:
+                    # r_profile is symmetric [ramp, flat, ramp_down]
+                    k_line = np.linspace(-k_max, k_max, n_samples) * r_profile # Full spoke, scaled by r_profile
                 kx = k_line * np.cos(angle)
                 ky = k_line * np.sin(angle)
                 kz = None
@@ -622,13 +975,37 @@ class KSpaceTrajectoryGenerator:
                 vd = self._variable_density_spiral(tt)
                 kx = k_max * vd * np.sin(theta) * np.cos(phi)
                 ky = k_max * vd * np.sin(theta) * np.sin(phi)
-                kz = k_max * vd * np.cos(theta)
+                kz = k_max * vd * r_profile * np.cos(theta) # r_profile incorporated here
             elif self.traj_type == "radial3d":
                 theta, phi = self._golden_angle(interleaf_idx)
-                k_line = np.linspace(-k_max, k_max, n_samples)
+                if self.ute_ramp_sampling:
+                    k_line = r_profile * k_max # Half-spoke
+                else:
+                    # For standard radial3d, r_profile is likely intended to make it ramped if not all ones
+                    k_line = np.linspace(-k_max, k_max, n_samples) * r_profile
                 kx = k_line * np.sin(theta) * np.cos(phi)
                 ky = k_line * np.sin(theta) * np.sin(phi)
                 kz = k_line * np.cos(theta)
+            elif self.traj_type == "epi_3d":
+                if self.dim != 3:
+                    raise ValueError("epi_3d trajectory requires dim=3")
+                # n_samples here is n_samples_x for the readout
+                return self._generate_epi_3d(interleaf_idx, t, n_samples, **local_params)
+            elif self.traj_type == "zte": # Added ZTE
+                if self.dim != 3:
+                    raise ValueError("ZTE trajectory (type 'zte') requires dim=3")
+                # ZTE behaves like radial3d; ute_ramp_sampling flag controls center-out ramp
+                theta, phi = self._golden_angle(interleaf_idx)
+                # k_max and r_profile are already resolved at the start of _generate_standard
+                if self.ute_ramp_sampling:
+                    k_line = r_profile * k_max # Half-spoke (center-out ramp)
+                else:
+                    # Full spoke, scaled by symmetric r_profile (not typical ZTE if this branch is hit)
+                    k_line = np.linspace(-k_max, k_max, n_samples) * r_profile
+                kx = k_line * np.sin(theta) * np.cos(phi)
+                ky = k_line * np.sin(theta) * np.sin(phi)
+                kz = k_line * np.cos(theta)
+                # Gradients will be calculated below, common for most 3D trajectories
             else:
                 raise ValueError(f"Unknown 3D traj_type {self.traj_type}")
             gx = np.gradient(kx, self.dt) / self.gamma
@@ -638,6 +1015,75 @@ class KSpaceTrajectoryGenerator:
             raise ValueError("dim must be 2 or 3")
         gx, gy, gz = self._enforce_gradient_limits(gx, gy, gz)
         return kx, ky, kz, gx, gy, gz
+
+    def _generate_epi_3d(self, interleaf_idx, time_vector_x, n_samples_x, **params):
+        """Generates a single Kx readout line for a 3D EPI trajectory at a specific (Ky, Kz) encode."""
+        
+        # Resolve parameters (use instance attributes, override with params if provided)
+        fov_x = params.get("fov", self.fov) # Readout FOV
+        res_x = params.get("resolution", self.resolution) # Readout resolution
+
+        fov_y = params.get("epi_3d_fov_y", self.epi_3d_fov_y)
+        if fov_y is None: fov_y = fov_x # Default to readout FOV
+        res_y = params.get("epi_3d_resolution_y", self.epi_3d_resolution_y)
+        if res_y is None: res_y = res_x # Default to readout resolution
+        
+        fov_z = params.get("epi_3d_fov_z", self.epi_3d_fov_z)
+        if fov_z is None: fov_z = fov_x # Default to readout FOV
+        res_z = params.get("epi_3d_resolution_z", self.epi_3d_resolution_z)
+        if res_z is None: res_z = res_x # Default to readout resolution
+
+        k_max_x = 1 / (2 * res_x + 1e-9)
+        k_max_y = 1 / (2 * res_y + 1e-9)
+        k_max_z = 1 / (2 * res_z + 1e-9)
+
+        num_phase_encodes_y = int(round(fov_y / res_y)) if res_y > 0 else 1
+        num_phase_encodes_y = max(1, num_phase_encodes_y)
+        num_phase_encodes_z = int(round(fov_z / res_z)) if res_z > 0 else 1
+        num_phase_encodes_z = max(1, num_phase_encodes_z)
+
+        delta_ky = (2 * k_max_y) / num_phase_encodes_y if num_phase_encodes_y > 1 else 0.0
+        delta_kz = (2 * k_max_z) / num_phase_encodes_z if num_phase_encodes_z > 1 else 0.0
+        
+        # Map interleaf_idx to (ky_idx, kz_idx)
+        # This assumes n_interleaves is set by the user to cover the desired YZ plane
+        # (e.g., n_interleaves = num_phase_encodes_y * num_phase_encodes_z for full coverage)
+        kz_idx = interleaf_idx // num_phase_encodes_y
+        ky_idx = interleaf_idx % num_phase_encodes_y
+
+        # Check if current interleaf is beyond the planned Kz coverage based on num_phase_encodes_z
+        # This might happen if n_interleaves > num_phase_encodes_y * num_phase_encodes_z
+        if kz_idx >= num_phase_encodes_z:
+            # This shot is outside the primary Kz encoding range.
+            # Depending on desired behavior, could error, clamp, or let kz_target go beyond k_max_z.
+            # For now, let it proceed; kz_target will simply be beyond the nominal k_max_z.
+            # Or, more safely, one might want to cap it or warn.
+            # print(f"Warning: interleaf_idx {interleaf_idx} results in kz_idx {kz_idx} >= num_phase_encodes_z {num_phase_encodes_z}")
+            pass
+
+
+        current_ky_target = -k_max_y + ky_idx * delta_ky + (delta_ky / 2 if num_phase_encodes_y > 1 else 0.0)
+        current_kz_target = -k_max_z + kz_idx * delta_kz + (delta_kz / 2 if num_phase_encodes_z > 1 else 0.0)
+        if num_phase_encodes_y == 1: current_ky_target = 0.0 # Single PE line in Y is at center
+        if num_phase_encodes_z == 1: current_kz_target = 0.0 # Single PE line in Z is at center
+
+
+        # Kx readout (frequency encoding)
+        kx_readout = np.linspace(-k_max_x, k_max_x, n_samples_x)
+        if ky_idx % 2 == 1: # Flip Kx readout for odd Ky lines (traditional EPI raster)
+            kx_readout = kx_readout[::-1]
+
+        kx_interleaf = kx_readout
+        ky_interleaf = np.full(n_samples_x, current_ky_target)
+        kz_interleaf = np.full(n_samples_x, current_kz_target)
+
+        # Calculate gradients (np.gradient will handle mostly zero grads for ky, kz)
+        # Note: self.dt and self.gamma are available from the instance
+        gx = np.gradient(kx_interleaf, self.dt) / self.gamma
+        gy = np.gradient(ky_interleaf, self.dt) / self.gamma 
+        gz = np.gradient(kz_interleaf, self.dt) / self.gamma
+        
+        return kx_interleaf, ky_interleaf, kz_interleaf, gx, gy, gz
 
     def _add_spoiler(self, kx, ky, kz, gx, gy, gz):
         n_spoil = self.ramp_samples
