@@ -10,48 +10,283 @@ class Trajectory:
     Container for a k-space trajectory and associated data.
     Includes additional trajectory metrics like max PNS, max slew, FOV, and resolution.
     """
-    def __init__(self, name, points, gradients=None, dt=None, metadata=None):
+    def __init__(self, name, kspace_points_rad_per_m, gradient_waveforms_Tm=None, dt_seconds=None, metadata=None):
         """
         Args:
             name (str): Trajectory name/description.
-            points (np.ndarray): [D, N] or [N, D] k-space coordinates (usually D=2 or 3).
-            gradients (np.ndarray, optional): [D, N] or [N, D] gradient waveforms.
-            dt (float, optional): Dwell/sample time in seconds.
+            kspace_points_rad_per_m (np.ndarray): [D, N] or [N, D] k-space coordinates in rad/m.
+            gradient_waveforms_Tm (np.ndarray, optional): [D, N] or [N, D] gradient waveforms in T/m.
+            dt_seconds (float, optional): Dwell/sample time in seconds.
             metadata (dict, optional): Additional information.
         """
         self.name = name
-        self.points = np.array(points)
-        self.gradients = np.array(gradients) if gradients is not None else None
-        self.dt = dt
+        self.kspace_points_rad_per_m = np.array(kspace_points_rad_per_m)
+        self.gradient_waveforms_Tm = np.array(gradient_waveforms_Tm) if gradient_waveforms_Tm is not None else None
+        self.dt_seconds = dt_seconds
         self.metadata = metadata or {}
 
         # Automatically populate additional metrics
         self._compute_metrics()
 
+    def _calculate_slew_rate(self):
+        """Calculates slew rate and stores it in metadata."""
+        if self.gradient_waveforms_Tm is not None and self.dt_seconds is not None:
+            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
+            max_slew_rate_Tm_per_s = np.max(np.linalg.norm(slew, axis=0))
+            self.metadata['max_slew_rate_Tm_per_s'] = max_slew_rate_Tm_per_s
+        else:
+            self.metadata['max_slew_rate_Tm_per_s'] = None
+
+    def _calculate_pns(self):
+        """Calculates PNS metrics and stores them in metadata."""
+        if self.gradient_waveforms_Tm is not None and self.dt_seconds is not None:
+            # PNS_max_abs_gradient_sum_xyz = max(abs(Gx) + abs(Gy) + abs(Gz))
+            abs_grad_sum = np.sum(np.abs(self.gradient_waveforms_Tm), axis=0)
+            self.metadata['pns_max_abs_gradient_sum_xyz'] = np.max(abs_grad_sum)
+
+            # PNS_max_abs_slew_sum_xyz = max(abs(SlewX) + abs(SlewY) + abs(SlewZ))
+            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
+            abs_slew_sum = np.sum(np.abs(slew), axis=0)
+            self.metadata['pns_max_abs_slew_sum_xyz'] = np.max(abs_slew_sum)
+        else:
+            self.metadata['pns_max_abs_gradient_sum_xyz'] = None
+            self.metadata['pns_max_abs_slew_sum_xyz'] = None
+
+    def _calculate_fov(self):
+        """Calculates FOV and stores it in metadata."""
+        if self.kspace_points_rad_per_m is not None:
+            # Ensure points are [D, N]
+            points = self.kspace_points_rad_per_m
+            if points.shape[0] > points.shape[1] and points.shape[0] > 3 : # Heuristic for N, D vs D, N
+                 points = points.T
+
+            k_extent_rad_per_m = np.max(np.abs(points), axis=-1)
+            # Add a small epsilon to prevent division by zero if k_extent is 0 for a dimension
+            fov_m = 1 / (2 * k_extent_rad_per_m + 1e-9)
+            self.metadata['fov_estimate_m'] = fov_m.tolist()
+            self.metadata['fov_estimate_mm'] = (fov_m * 1e3).tolist()
+        else:
+            self.metadata['fov_estimate_m'] = None
+            self.metadata['fov_estimate_mm'] = None
+
+    def _calculate_resolution(self):
+        """Calculates resolution and stores it in metadata."""
+        if self.kspace_points_rad_per_m is not None:
+            # Ensure points are [D, N]
+            points = self.kspace_points_rad_per_m
+            if points.shape[0] > points.shape[1] and points.shape[0] > 3 : # Heuristic for N, D vs D, N
+                 points = points.T
+
+            # For anisotropic resolution, we might consider resolution along each k-space axis.
+            # A common definition is related to the max k-space extent along each axis.
+            # However, for a general trajectory, "resolution" is often simplified to 1 / (2 * max_k_radius)
+            # Here we'll provide both: an estimate per dimension and an overall estimate.
+
+            # Overall resolution based on max k-space radius
+            max_k_radius_rad_per_m = np.max(np.linalg.norm(points, axis=0))
+            resolution_m_overall = 1 / (2 * max_k_radius_rad_per_m + 1e-9) # meters
+            self.metadata['resolution_overall_estimate_m'] = resolution_m_overall
+            self.metadata['resolution_overall_estimate_mm'] = resolution_m_overall * 1e3
+
+            # Per-dimension resolution estimate (can be debated, this is one way)
+            # This is similar to FOV calculation but for resolution it's 1 / (2 * max_k_coord_on_axis)
+            # This might not be the most standard definition for arbitrary trajectories but can be useful.
+            # For now, let's stick to the overall resolution as it's more common for non-Cartesian.
+            # If anisotropic definition is strictly needed, it would be more like:
+            # delta_k = np.max(points, axis=1) - np.min(points, axis=1) # k-space coverage along each axis
+            # resolution_anisotropic_m = 1 / (delta_k + 1e-9)
+            # self.metadata['resolution_anisotropic_estimate_m'] = resolution_anisotropic_m.tolist()
+            # self.metadata['resolution_anisotropic_estimate_mm'] = (resolution_anisotropic_m * 1e3).tolist()
+            # For now, only overall resolution is stored.
+        else:
+            self.metadata['resolution_overall_estimate_m'] = None
+            self.metadata['resolution_overall_estimate_mm'] = None
+
+
     def _compute_metrics(self):
-        if self.gradients is not None and self.dt is not None:
-            # Slew rate: dG/dt (T/m/s)
-            slew = np.diff(self.gradients, axis=-1) / self.dt
-            max_slew = np.max(np.linalg.norm(slew, axis=0))
-            self.metadata['max_slew_rate'] = max_slew  # T/m/s
+        """Computes all trajectory metrics."""
+        self._calculate_slew_rate()
+        self._calculate_pns()
+        self._calculate_fov()
+        self._calculate_resolution()
 
-            # Estimate PNS (simplified): max slew as proxy
-            self.metadata['max_pns_proxy'] = max_slew  # Not real units, use as indicator
+    def get_duration_seconds(self) -> Optional[float]:
+        """Returns total trajectory duration in seconds."""
+        if self.dt_seconds is not None and self.kspace_points_rad_per_m is not None:
+            return self.get_num_points() * self.dt_seconds
+        return None
 
-        # FOV estimation from max extent in k-space
-        if self.points is not None:
-            k_extent = np.max(np.abs(self.points), axis=-1)
-            fov = 1 / (2 * k_extent + 1e-9)  # avoid divide by zero
-            self.metadata['fov_estimate_mm'] = (fov * 1e3).tolist()  # convert to mm
+    def get_max_grad_Tm(self) -> Optional[float]:
+        """Returns the maximum absolute gradient amplitude (T/m)."""
+        if self.gradient_waveforms_Tm is not None:
+            return np.max(np.linalg.norm(self.gradient_waveforms_Tm, axis=0))
+        return None
 
-            # Resolution estimate ~ 1 / max k-space radius
-            max_k_radius = np.max(np.linalg.norm(self.points, axis=0))
-            resolution = 1 / (2 * max_k_radius + 1e-9)
-            self.metadata['resolution_estimate_mm'] = resolution * 1e3
+    def get_max_slew_Tm_per_s(self) -> Optional[float]:
+        """Returns the maximum absolute slew rate (T/m/s)."""
+        if 'max_slew_rate_Tm_per_s' in self.metadata:
+            return self.metadata['max_slew_rate_Tm_per_s']
+        elif self.gradient_waveforms_Tm is not None and self.dt_seconds is not None and self.gradient_waveforms_Tm.shape[-1] > 1:
+            slew = np.diff(self.gradient_waveforms_Tm, axis=-1) / self.dt_seconds
+            return np.max(np.linalg.norm(slew, axis=0))
+        return None
+
+    def get_num_points(self) -> int:
+        """Returns the number of k-space points."""
+        # Assuming kspace_points_rad_per_m is [D, N] or [N,D]
+        # If [D,N], N is shape[1]. If [N,D], N is shape[0], assuming D < N.
+        # A common convention is D <= 3.
+        if self.kspace_points_rad_per_m.shape[0] <= 3 or self.kspace_points_rad_per_m.shape[0] < self.kspace_points_rad_per_m.shape[1]:
+            return self.kspace_points_rad_per_m.shape[1]
+        return self.kspace_points_rad_per_m.shape[0]
+
+
+    def get_num_dimensions(self) -> int:
+        """Returns the number of spatial dimensions."""
+        # Assuming kspace_points_rad_per_m is [D, N] or [N,D]
+        # If [D,N], D is shape[0]. If [N,D], D is shape[1].
+        if self.kspace_points_rad_per_m.shape[0] <= 3 or self.kspace_points_rad_per_m.shape[0] < self.kspace_points_rad_per_m.shape[1]:
+            return self.kspace_points_rad_per_m.shape[0]
+        return self.kspace_points_rad_per_m.shape[1]
+
 
     def export(self, filename, filetype=None):
         """
         Export trajectory to file (CSV, .npy, .npz, .txt).
+        Args:
+            filename (str): Output file name.
+            filetype (str, optional): 'csv', 'npy', 'npz', or 'txt'. Inferred from extension if not given.
+        """
+        if filetype is None:
+            if filename.endswith('.csv'):
+                filetype = 'csv'
+            elif filename.endswith('.npy'):
+                filetype = 'npy'
+            elif filename.endswith('.npz'):
+                filetype = 'npz'
+            else: # Default to text if extension is unknown or not provided and not one of the above
+                filetype = 'txt'
+        
+        # Ensure points are [N, D] for export
+        points_to_export = self.kspace_points_rad_per_m
+        # Heuristic: if first dim is smaller than second AND first dim is <=3, assume it's [D, N]
+        if points_to_export.ndim == 2 and points_to_export.shape[0] < points_to_export.shape[1] and points_to_export.shape[0] <=3 :
+            points_to_export = points_to_export.T
+
+        if filetype == 'csv':
+            np.savetxt(filename, points_to_export, delimiter=',')
+        elif filetype == 'npy':
+            np.save(filename, points_to_export)
+        elif filetype == 'npz':
+            np.savez(filename, kspace_points_rad_per_m=points_to_export, 
+                     gradient_waveforms_Tm=self.gradient_waveforms_Tm, 
+                     dt_seconds=self.dt_seconds, metadata=self.metadata)
+        elif filetype == 'txt':
+            np.savetxt(filename, points_to_export)
+        else:
+            raise ValueError(f"Unsupported filetype: {filetype}")
+
+    @classmethod
+    def import_from(cls, filename):
+        """
+        Import a trajectory from a file.
+        """
+        if filename.endswith('.csv') or filename.endswith('.txt'):
+            points = np.loadtxt(filename, delimiter=',' if filename.endswith('.csv') else None)
+            # Assuming imported points are N, D.
+            # A more robust check could be added here if D > N and D > 3 is a possible case for CSV/TXT.
+            return cls(name=filename, kspace_points_rad_per_m=points)
+        elif filename.endswith('.npy'):
+            points = np.load(filename)
+            # .npy could be D,N or N,D. The constructor will handle it.
+            return cls(name=filename, kspace_points_rad_per_m=points)
+        elif filename.endswith('.npz'):
+            data = np.load(filename, allow_pickle=True)
+            # Convert legacy keys if present, prioritizing new names
+            points_key = 'kspace_points_rad_per_m' if 'kspace_points_rad_per_m' in data else 'points' if 'points' in data else 'kspace'
+            gradients_key = 'gradient_waveforms_Tm' if 'gradient_waveforms_Tm' in data else 'gradients'
+            dt_key = 'dt_seconds' if 'dt_seconds' in data else 'dt'
+            
+            points = data[points_key]
+            # NPZ may store gradients as None, handle this
+            gradients_data = data.get(gradients_key)
+            gradients = np.array(gradients_data) if gradients_data is not None else None
+            
+            dt_data = data.get(dt_key)
+            dt = dt_data.item() if dt_data is not None and hasattr(dt_data, 'item') else dt_data
+
+            # Ensure metadata is a dictionary, even if stored as an array by older versions
+            metadata_raw = data.get('metadata')
+            if metadata_raw is not None:
+                metadata = metadata_raw.item() if hasattr(metadata_raw, 'item') else dict(metadata_raw) if not isinstance(metadata_raw, dict) else metadata_raw
+            else:
+                metadata = {}
+                
+            return cls(name=filename, kspace_points_rad_per_m=points, 
+                       gradient_waveforms_Tm=gradients, dt_seconds=dt, metadata=metadata)
+        else:
+            raise ValueError(f"Unsupported filetype or extension for: {filename}")
+
+    def summary(self):
+        """
+        Print a detailed summary of the trajectory, including its properties and calculated metrics.
+        """
+        num_dims = self.get_num_dimensions()
+        num_points = self.get_num_points()
+        duration_ms = self.get_duration_seconds() * 1e3 if self.get_duration_seconds() is not None else "N/A"
+        
+        print(f"\n--- Trajectory Summary: '{self.name}' ---")
+        print(f"  Dimensions: {num_dims}D")
+        print(f"  Number of Points: {num_points}")
+        print(f"  Duration: {duration_ms:.2f} ms" if isinstance(duration_ms, float) else f"Duration: {duration_ms}")
+        print(f"  Dwell Time (dt): {self.dt_seconds * 1e6:.2f} µs" if self.dt_seconds is not None else "Dwell Time (dt): N/A")
+
+        if self.gradient_waveforms_Tm is not None:
+            print("\n  Gradients:")
+            max_grad_mT_m = self.get_max_grad_Tm() * 1e3 if self.get_max_grad_Tm() is not None else "N/A"
+            max_slew_Tm_s = self.get_max_slew_Tm_per_s() if self.get_max_slew_Tm_per_s() is not None else "N/A"
+            print(f"    Max Gradient Amplitude: {max_grad_mT_m:.2f} mT/m" if isinstance(max_grad_mT_m, float) else f"    Max Gradient Amplitude: {max_grad_mT_m}")
+            print(f"    Max Slew Rate: {max_slew_Tm_s:.2f} T/m/s" if isinstance(max_slew_Tm_s, float) else f"    Max Slew Rate: {max_slew_Tm_s}")
+        else:
+            print("\n  Gradients: Not provided.")
+
+        print("\n  Calculated Metrics (from metadata):")
+        if not self.metadata:
+            print("    No metadata computed or stored.")
+        else:
+            for key, value in self.metadata.items():
+                if value is None:
+                    print(f"    {key}: N/A")
+                elif isinstance(value, list) and all(isinstance(item, (float, np.floating, int))) :
+                    unit = ""
+                    if "_mm" in key: unit = "mm"
+                    elif "_m" in key: unit = "m"
+                    elif "_Tm_per_s" in key: unit = "T/m/s"
+                    elif "_xyz" in key: unit = "a.u." # Assuming arbitrary units for PNS sums for now
+                    
+                    # Format numbers: scientific for small/large, fixed for others
+                    formatted_values = []
+                    for v_item in value:
+                        if abs(v_item) < 1e-3 or abs(v_item) > 1e4 and v_item != 0:
+                             formatted_values.append(f"{v_item:.2e}")
+                        else:
+                             formatted_values.append(f"{v_item:.3f}")
+                    value_str = ", ".join(formatted_values)
+                    print(f"    {key}: [{value_str}] {unit}")
+                elif isinstance(value, (float, np.floating, int)):
+                    unit = ""
+                    if "_mm" in key: unit = "mm"
+                    elif "_m" in key: unit = "m"
+                    elif "_Tm_per_s" in key: unit = "T/m/s"
+                    elif "_xyz" in key: unit = "a.u."
+
+                    if abs(value) < 1e-3 or abs(value) > 1e4 and value != 0:
+                        print(f"    {key}: {value:.2e} {unit}")
+                    else:
+                        print(f"    {key}: {value:.3f} {unit}")
+                else:
+                    print(f"    {key}: {value}")
+        print("--- End of Summary ---")
         Args:
             filename (str): Output file name.
             filetype (str, optional): 'csv', 'npy', 'npz', or 'txt'. Inferred from extension if not given.
