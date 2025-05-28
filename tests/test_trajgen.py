@@ -7,6 +7,8 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from trajgen import Trajectory, KSpaceTrajectoryGenerator, COMMON_NUCLEI_GAMMA_HZ_PER_T
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D # For 3D plot testing
 
 class TestSharedConstants(unittest.TestCase):
     def test_common_nuclei_gamma(self):
@@ -52,6 +54,14 @@ class TestTrajectory(unittest.TestCase):
         self.metadata_example = {'info': 'test_trajectory'}
         self.dead_time_start = 0.001 # 1 ms
         self.dead_time_end = 0.0005 # 0.5 ms
+
+        # For plotting tests
+        self.kspace_2d_plot_test = np.random.rand(2, 20) * 250 - 125 # 20 random 2D points
+        self.kspace_3d_plot_test = np.random.rand(3, 30) * 250 - 125 # 30 random 3D points
+
+
+    def tearDown(self):
+        plt.close('all') # Close all figures after each test
 
     def test_trajectory_initialization_basic(self):
         traj = Trajectory("test1D", self.kspace_1d, dt_seconds=self.dt, metadata=self.metadata_example)
@@ -278,6 +288,70 @@ class TestTrajectory(unittest.TestCase):
         self.assertEqual(len(cell_sizes_3d), 5)
         self.assertTrue(np.isfinite(cell_sizes_3d[4])) # Center point
         self.assertTrue(np.all(np.isinf(cell_sizes_3d[:4]))) # Corner points
+
+    def test_plot_3d_execution(self):
+        # Test with a 3D trajectory
+        traj_3d = Trajectory("test_plot3d", self.kspace_3d_plot_test, dt_seconds=self.dt)
+        ax = traj_3d.plot_3d()
+        self.assertIsNotNone(ax)
+        self.assertIsInstance(ax, Axes3D)
+        plt.close('all')
+
+        # Test with subsampling parameters
+        ax_sub = traj_3d.plot_3d(max_total_points=10, max_interleaves=1, point_stride=2, interleaf_stride=1)
+        self.assertIsNotNone(ax_sub)
+        self.assertIsInstance(ax_sub, Axes3D)
+        plt.close('all')
+
+        # Test with a pre-existing ax
+        fig = plt.figure()
+        pre_ax = fig.add_subplot(111, projection='3d')
+        returned_ax = traj_3d.plot_3d(ax=pre_ax)
+        self.assertIs(returned_ax, pre_ax)
+        plt.close('all')
+
+        # Test on a 2D trajectory (should print message and return None or original ax)
+        traj_2d = Trajectory("test_plot3d_on_2d", self.kspace_2d_plot_test, dt_seconds=self.dt)
+        # Suppress print output for this specific call if possible, or just check return
+        returned_ax_2d = traj_2d.plot_3d() 
+        self.assertIsNone(returned_ax_2d) # Expecting None as no ax was passed and it's not 3D
+        
+        fig_2d, ax_2d_passed = plt.subplots() # Create a 2D axes
+        returned_ax_2d_passed = traj_2d.plot_3d(ax=ax_2d_passed)
+        self.assertIs(returned_ax_2d_passed, ax_2d_passed) # Should return the passed ax
+        plt.close('all')
+
+
+    def test_plot_voronoi_execution(self):
+        # Test with a 2D trajectory
+        # Use fewer points for Voronoi as it can be slow
+        kspace_2d_voronoi = np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5]]).T # 5 points
+        traj_2d = Trajectory("test_plot_voronoi_2d", kspace_2d_voronoi, dt_seconds=self.dt)
+        _ = traj_2d.calculate_voronoi_density() # Ensure data is computed
+        
+        ax = traj_2d.plot_voronoi()
+        self.assertIsNotNone(ax)
+        self.assertIsInstance(ax, plt.Axes)
+        plt.close('all')
+
+        # Test with different parameters
+        ax_params = traj_2d.plot_voronoi(color_by_area=False, show_vertices=True, cmap='cividis')
+        self.assertIsNotNone(ax_params)
+        self.assertIsInstance(ax_params, plt.Axes)
+        plt.close('all')
+
+        # Test with a pre-existing ax
+        fig, pre_ax = plt.subplots()
+        returned_ax = traj_2d.plot_voronoi(ax=pre_ax)
+        self.assertIs(returned_ax, pre_ax)
+        plt.close('all')
+
+        # Test on a 3D trajectory (should fallback to plot_3d)
+        traj_3d = Trajectory("test_plot_voronoi_3d", self.kspace_3d_plot_test, dt_seconds=self.dt)
+        ax_3d_fallback = traj_3d.plot_voronoi()
+        self.assertIsNotNone(ax_3d_fallback)
+        self.assertIsInstance(ax_3d_fallback, Axes3D) # Checks if plot_3d was called
+        plt.close('all')
 
 
 class TestKSpaceTrajectoryGenerator(unittest.TestCase):
