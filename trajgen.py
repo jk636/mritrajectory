@@ -4,6 +4,20 @@ from scipy.spatial import Voronoi, ConvexHull
 from scipy.spatial.qhull import QhullError
 
 
+# Gyromagnetic ratios for common nuclei in Hz/T
+# Source: Mostly based on standard values, e.g., NIST, textbook tables.
+COMMON_NUCLEI_GAMMA_HZ_PER_T = {
+    '1H': 42.576e6,     # Proton
+    '13C': 10.705e6,    # Carbon-13
+    '31P': 17.235e6,    # Phosphorus-31
+    '19F': 40.052e6,    # Fluorine-19
+    '23Na': 11.262e6,   # Sodium-23
+    '129Xe': 11.777e6,  # Xenon-129 (hyperpolarized gas MRI)
+    '2H': 6.536e6,      # Deuterium
+    '7Li': 16.546e6,     # Lithium-7
+}
+
+
 import numpy as np
 
 import numpy as np
@@ -680,7 +694,7 @@ class KSpaceTrajectoryGenerator:
         g_max=40e-3,
         s_max=150.0,
         n_interleaves=8,
-        gamma=42.576e6,
+        gamma=42.576e6, # Gyromagnetic ratio in Hz/T. Defaults to 42.576e6 (for 1H). Common values in COMMON_NUCLEI_GAMMA_HZ_PER_T
         traj_type='spiral',
         turns=1,
         ramp_fraction=0.1,
@@ -710,13 +724,54 @@ class KSpaceTrajectoryGenerator:
         # UTE ramp sampling
         ute_ramp_sampling: bool = False,
         ):
+        """
+        Initializes the KSpaceTrajectoryGenerator.
+
+        Args:
+            fov (float): Field of View in meters for the primary readout dimension (typically x).
+            resolution (float): Resolution in meters for the primary readout dimension.
+            dt (float): Dwell time / sampling interval in seconds.
+            g_max (float): Maximum gradient amplitude in T/m.
+            s_max (float): Maximum slew rate in T/m/s.
+            n_interleaves (int): Number of interleaves or shots. For 'stackofspirals', this is spirals per stack.
+                               For 'epi_3d', this is total Ky-Kz phase encode lines.
+            gamma (float): Gyromagnetic ratio in Hz/T. Defaults to 42.576e6 (for 1H).
+                           Common values for other nuclei can be found in `trajgen.COMMON_NUCLEI_GAMMA_HZ_PER_T`.
+            traj_type (str): Type of trajectory to generate. Examples: 'spiral', 'radial', 'epi', 'cones',
+                             'stackofspirals', 'radial3d', 'zte', 'epi_3d', 'rosette', 'phyllotaxis'.
+            turns (int): Number of turns for spiral trajectories.
+            ramp_fraction (float): Fraction of points for ramp-up/down for non-UTE profiles.
+            add_rewinder (bool): If True, adds a rewinder gradient to return to k-space center.
+            add_spoiler (bool): If True, adds a spoiler gradient.
+            add_slew_limited_ramps (bool): If True, uses cosine ramps, else linear ramps.
+            dim (int): Number of dimensions (2 or 3).
+            n_stacks (Optional[int]): Number of stacks for 'stackofspirals'.
+            zmax (Optional[float]): Maximum k-space extent in z for 'stackofspirals' (if None, derived from k_max_xy).
+            custom_traj_func (Optional[Callable]): User-defined function for custom trajectories.
+            per_interleaf_params (Optional[Dict]): Dictionary to override parameters for specific interleaves.
+            time_varying_params (Optional[Callable]): Function to vary parameters over time.
+            use_golden_angle (bool): If True, uses golden angle scheme for interleaves (radial, spiral).
+            vd_method (str): Variable density method for spirals ('power', 'hybrid', 'gaussian', 'exponential', 'flat', 'custom').
+            vd_alpha (Optional[float]): Alpha for 'power' or 'hybrid' variable density.
+            vd_func (Optional[Callable]): Custom variable density function.
+            vd_flat (Optional[float]): Flat region proportion for 'hybrid' variable density.
+            vd_sigma (Optional[float]): Sigma for 'gaussian' variable density.
+            vd_rho (Optional[float]): Rho for 'exponential' variable density.
+            spiral_out_out (bool): If True, generates spiral-out-out trajectories.
+            spiral_out_out_split (float): Fraction of samples for the first spiral-out segment.
+            epi_3d_fov_y (Optional[float]): FOV in Y for 3D EPI. Defaults to main `fov`.
+            epi_3d_resolution_y (Optional[float]): Resolution in Y for 3D EPI. Defaults to main `resolution`.
+            epi_3d_fov_z (Optional[float]): FOV in Z for 3D EPI. Defaults to main `fov`.
+            epi_3d_resolution_z (Optional[float]): Resolution in Z for 3D EPI. Defaults to main `resolution`.
+            ute_ramp_sampling (bool): If True, enables center-out ramp sampling (half-spokes) for radial/cone/ZTE.
+        """
         self.fov = fov
         self.resolution = resolution
         self.dt = dt
         self.g_max = g_max
         self.s_max = s_max
         self.n_interleaves = n_interleaves
-        self.gamma = gamma
+        self.gamma = gamma  # Gyromagnetic ratio in Hz/T. Defaults to 42.576e6 (for 1H). Common values in COMMON_NUCLEI_GAMMA_HZ_PER_T
         self.traj_type = traj_type
         self.turns = turns
         self.ramp_fraction = ramp_fraction

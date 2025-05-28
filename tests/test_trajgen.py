@@ -6,7 +6,27 @@ import sys
 # Add the parent directory to the Python path to allow importing trajgen
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from trajgen import Trajectory, KSpaceTrajectoryGenerator
+from trajgen import Trajectory, KSpaceTrajectoryGenerator, COMMON_NUCLEI_GAMMA_HZ_PER_T
+
+class TestSharedConstants(unittest.TestCase):
+    def test_common_nuclei_gamma(self):
+        self.assertIsNotNone(COMMON_NUCLEI_GAMMA_HZ_PER_T)
+        self.assertIsInstance(COMMON_NUCLEI_GAMMA_HZ_PER_T, dict)
+
+        # Check for specific key presence
+        expected_keys = ['1H', '13C', '31P', '19F', '23Na', '129Xe', '2H', '7Li']
+        for key in expected_keys:
+            self.assertIn(key, COMMON_NUCLEI_GAMMA_HZ_PER_T)
+            # Check that values are positive floats
+            self.assertIsInstance(COMMON_NUCLEI_GAMMA_HZ_PER_T[key], float)
+            self.assertGreater(COMMON_NUCLEI_GAMMA_HZ_PER_T[key], 0)
+
+        # Check minimum size
+        self.assertGreaterEqual(len(COMMON_NUCLEI_GAMMA_HZ_PER_T), len(expected_keys))
+
+        # Check a specific known value (e.g. 1H)
+        self.assertAlmostEqual(COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'], 42.576e6, places=3)
+
 
 class TestTrajectory(unittest.TestCase):
     def setUp(self):
