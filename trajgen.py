@@ -2103,3 +2103,225 @@ def reconstruct_image(kspace_data: np.ndarray,
     if verbose: print("Image reconstruction complete.")
     
     return image_magnitude
+
+
+class GIRF:
+    """
+    Represents a Gradient Impulse Response Function (GIRF).
+
+    Attributes:
+        h_t_x (np.ndarray): Impulse response for the X-axis.
+        h_t_y (np.ndarray): Impulse response for the Y-axis.
+        h_t_z (np.ndarray): Impulse response for the Z-axis.
+        dt_girf (float): Time resolution of the GIRF data in seconds.
+        name (Optional[str]): Optional name for the GIRF profile.
+    """
+    def __init__(self, h_t_x: np.ndarray, h_t_y: np.ndarray, h_t_z: np.ndarray, 
+                 dt_girf: float, name: Optional[str] = None):
+        """
+        Initializes the GIRF object.
+
+        Args:
+            h_t_x (np.ndarray): 1D NumPy array for X-axis impulse response.
+            h_t_y (np.ndarray): 1D NumPy array for Y-axis impulse response.
+            h_t_z (np.ndarray): 1D NumPy array for Z-axis impulse response.
+            dt_girf (float): Time resolution of GIRF data in seconds.
+            name (Optional[str], optional): Name for the GIRF profile. Defaults to None.
+        
+        Raises:
+            ValueError: If dt_girf is not positive or if h_t arrays are not 1D.
+        """
+        if dt_girf <= 0:
+            raise ValueError("dt_girf must be positive.")
+
+        self.h_t_x = np.asarray(h_t_x)
+        self.h_t_y = np.asarray(h_t_y)
+        self.h_t_z = np.asarray(h_t_z)
+        
+        if self.h_t_x.ndim != 1:
+            raise ValueError("h_t_x must be a 1D array.")
+        if self.h_t_y.ndim != 1:
+            raise ValueError("h_t_y must be a 1D array.")
+        if self.h_t_z.ndim != 1:
+            raise ValueError("h_t_z must be a 1D array.")
+            
+        self.dt_girf = float(dt_girf)
+        self.name = name if name is not None else "CustomGIRF"
+
+    def __repr__(self) -> str:
+        """
+        Returns a string representation of the GIRF object.
+        """
+        name_str = f"'{self.name}'" if self.name else "None"
+        return (f"GIRF(name={name_str}, dt_girf={self.dt_girf:.2e}, "
+                f"x_len={len(self.h_t_x)}, y_len={len(self.h_t_y)}, z_len={len(self.h_t_z)})")
+
+    @classmethod
+    def from_files(cls, filepath_x: str, filepath_y: str, filepath_z: str, 
+                   dt_girf: float, name: Optional[str] = None) -> 'GIRF':
+        """
+        Loads GIRF data from .npy files for X, Y, and Z axes.
+
+        Args:
+            filepath_x (str): Path to the .npy file for X-axis GIRF.
+            filepath_y (str): Path to the .npy file for Y-axis GIRF.
+            filepath_z (str): Path to the .npy file for Z-axis GIRF.
+            dt_girf (float): Time resolution of the GIRF data in seconds.
+            name (Optional[str], optional): Name for the GIRF profile. 
+                                           If None, a default name is generated from filepaths. 
+                                           Defaults to None.
+
+        Returns:
+            GIRF: An instance of the GIRF class.
+
+        Raises:
+            FileNotFoundError: If any of the specified .npy files do not exist.
+            ValueError: If dt_girf is not positive, or if files are not valid .npy 
+                        or do not contain 1D arrays.
+        """
+        if dt_girf <= 0:
+            raise ValueError("dt_girf must be positive.")
+
+        try:
+            h_t_x = np.load(filepath_x)
+            h_t_y = np.load(filepath_y)
+            h_t_z = np.load(filepath_z)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Could not load GIRF data: {e.filename} not found.") from e
+        except Exception as e: # Catches other np.load errors (e.g. bad format)
+            raise ValueError(f"Error loading GIRF data from .npy files: {e}")
+
+        if h_t_x.ndim != 1:
+            raise ValueError(f"h_t_x from {filepath_x} must be a 1D array, got shape {h_t_x.shape}.")
+        if h_t_y.ndim != 1:
+            raise ValueError(f"h_t_y from {filepath_y} must be a 1D array, got shape {h_t_y.shape}.")
+        if h_t_z.ndim != 1:
+            raise ValueError(f"h_t_z from {filepath_z} must be a 1D array, got shape {h_t_z.shape}.")
+
+        if name is None:
+            # Generate a default name based on common prefix of filenames
+            try:
+                import os
+                bn_x = os.path.splitext(os.path.basename(filepath_x))[0]
+                bn_y = os.path.splitext(os.path.basename(filepath_y))[0]
+                bn_z = os.path.splitext(os.path.basename(filepath_z))[0]
+                # A simple common name strategy:
+                # If all basenames are identical (e.g. girf_x.npy, girf_y.npy, girf_z.npy -> girf)
+                # or if they share a common prefix that makes sense.
+                # Example: "systemA_girf_x.npy", "systemA_girf_y.npy" -> "systemA_girf"
+                # This can be tricky. Let's try a simple approach:
+                # Remove common suffixes like _x, _y, _z if they exist
+                name_candidate_x = bn_x[:-2] if bn_x.lower().endswith(('_x', '-x')) else bn_x
+                name_candidate_y = bn_y[:-2] if bn_y.lower().endswith(('_y', '-y')) else bn_y
+                name_candidate_z = bn_z[:-2] if bn_z.lower().endswith(('_z', '-z')) else bn_z
+
+                if name_candidate_x == name_candidate_y == name_candidate_z:
+                    default_name = name_candidate_x
+                else: # Fallback if names are too different
+                    default_name = f"GIRF_{bn_x[:5]}" 
+            except Exception: # In case path operations fail for any reason
+                default_name = "GIRF_from_files"
+            final_name = default_name
+        else:
+            final_name = name
+            
+        return cls(h_t_x, h_t_y, h_t_z, dt_girf, name=final_name)
+
+
+def apply_girf_convolution(gradient_waveform_1d: np.ndarray, 
+                           girf_h_t_1d: np.ndarray, 
+                           dt_gradient: float, 
+                           dt_girf: float) -> np.ndarray:
+    """
+    Applies a Gradient Impulse Response Function (GIRF) to a gradient waveform
+    via convolution, handling resampling of the GIRF if necessary.
+
+    Args:
+        gradient_waveform_1d (np.ndarray): The 1D input gradient waveform.
+        girf_h_t_1d (np.ndarray): The 1D GIRF impulse response.
+        dt_gradient (float): Time resolution (dt) of the gradient_waveform_1d in seconds.
+        dt_girf (float): Time resolution (dt) of the girf_h_t_1d in seconds.
+
+    Returns:
+        np.ndarray: The 1D gradient waveform convolved with the (potentially resampled) GIRF.
+                    Returns an empty array if either input waveform is empty.
+
+    Raises:
+        ValueError: If inputs are not 1D NumPy arrays, or if dt values are not positive.
+    """
+    # Input Validation
+    if not isinstance(gradient_waveform_1d, np.ndarray) or gradient_waveform_1d.ndim != 1:
+        raise ValueError("gradient_waveform_1d must be a 1D NumPy array.")
+    if not isinstance(girf_h_t_1d, np.ndarray) or girf_h_t_1d.ndim != 1:
+        raise ValueError("girf_h_t_1d must be a 1D NumPy array.")
+
+    if dt_gradient <= 0:
+        raise ValueError("dt_gradient must be positive.")
+    if dt_girf <= 0:
+        raise ValueError("dt_girf must be positive.")
+
+    if gradient_waveform_1d.size == 0 or girf_h_t_1d.size == 0:
+        return np.array([])
+
+    girf_h_t_to_use = girf_h_t_1d
+
+    # Resampling GIRF (if dt_gradient != dt_girf)
+    if not np.isclose(dt_gradient, dt_girf):
+        # Create time vector for the original GIRF
+        t_girf_original = np.arange(len(girf_h_t_1d)) * dt_girf
+        
+        original_girf_duration = (len(girf_h_t_1d) -1) * dt_girf if len(girf_h_t_1d) > 1 else 0.0
+        
+        # Ensure num_target_samples is at least 1 if original GIRF had some duration
+        # and avoid issues if original_girf_duration is zero.
+        if original_girf_duration <= 0: # Handles empty or single-point original GIRF effectively
+            num_target_samples = len(girf_h_t_1d) # Preserve length if duration is zero (e.g. single point)
+        else:
+            num_target_samples = int(round(original_girf_duration / dt_gradient)) + 1
+        
+        if num_target_samples <= 0 : num_target_samples = 1 # Ensure at least one sample for target time vector
+
+        t_girf_target = np.arange(num_target_samples) * dt_gradient
+        
+        if len(t_girf_original) == 0: 
+             girf_h_t_resampled = np.array([])
+        elif len(t_girf_original) == 1: 
+             # For a single point GIRF, replicate its value across the new time extent
+             # or place it as a scaled delta if that's desired.
+             # np.interp with single point xp, fp will extrapolate if t_girf_target is outside.
+             # A common way to think of a single point GIRF h[0] at dt_girf is as a delta function
+             # with area h[0]*dt_girf. When resampled to dt_gradient, it should be a delta
+             # h_res[0]*dt_gradient = h[0]*dt_girf => h_res[0] = h[0]*dt_girf/dt_gradient
+             # However, np.interp will just give h[0] at target points that match t_girf_original[0].
+             # Let's use a simpler approach: if GIRF is 1 point, it's a delta, sum is its value.
+             # Resampled should also be a delta-like shape (e.g. first point) scaled to preserve sum.
+             girf_h_t_resampled = np.zeros_like(t_girf_target)
+             if girf_h_t_resampled.size > 0:
+                girf_h_t_resampled[0] = girf_h_t_1d[0] # Initial value, will be scaled by sum preservation
+        else:
+             girf_h_t_resampled = np.interp(t_girf_target, t_girf_original, girf_h_t_1d)
+
+        # Normalization to preserve the sum (integral approximation)
+        sum_original_girf = np.sum(girf_h_t_1d)
+        sum_resampled_girf = np.sum(girf_h_t_resampled)
+
+        if not np.isclose(sum_resampled_girf, 0.0):
+            girf_h_t_resampled = girf_h_t_resampled * (sum_original_girf / sum_resampled_girf)
+        elif np.isclose(sum_resampled_girf, 0.0) and not np.isclose(sum_original_girf, 0.0):
+            # Resampled sum is zero but original wasn't. This implies an issue.
+            # For instance, if girf_h_t_resampled became all zeros due to interpolation.
+            # In this case, the scaled GIRF remains all zeros. No further action needed.
+            pass
+            
+        girf_h_t_to_use = girf_h_t_resampled
+    
+    if girf_h_t_to_use.size == 0:
+        # This can happen if the original GIRF was empty, or if resampling an extremely short GIRF
+        # resulted in an empty array (e.g. if num_target_samples was 0 and not caught).
+        # The initial check `gradient_waveform_1d.size == 0 or girf_h_t_1d.size == 0` handles empty original.
+        # If resampling leads to an empty girf_h_t_to_use, convolving with it would be like convolving with zero.
+        return np.zeros_like(gradient_waveform_1d)
+
+    convolved_gradient = np.convolve(gradient_waveform_1d, girf_h_t_to_use, mode='same')
+    
+    return convolved_gradient

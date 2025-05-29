@@ -1390,5 +1390,287 @@ class TestAdvancedTrajectoryTools(unittest.TestCase):
             display_trajectory(self.simple_2d_traj_obj, plot_type="invalid_plot_type_str")
 
 
+import tempfile
+import shutil
+from trajgen import GIRF # Import the GIRF class
+
+class TestGIRF(unittest.TestCase):
+    def setUp(self):
+        self.sample_ht_x = np.array([0.1, 0.2, 0.3, 0.2, 0.1])
+        self.sample_ht_y = np.array([0.2, 0.4, 0.2])
+        self.sample_ht_z = np.array([0.5, 0.5, 0.5, 0.5])
+        self.valid_dt_girf = 4e-6
+        self.test_girf_name = "TestGIRFProfile"
+
+        # For file-based tests
+        self.temp_dir = tempfile.mkdtemp()
+        self.filepath_x = os.path.join(self.temp_dir, 'girf_x.npy')
+        self.filepath_y = os.path.join(self.temp_dir, 'girf_y.npy')
+        self.filepath_z = os.path.join(self.temp_dir, 'girf_z.npy')
+        
+        np.save(self.filepath_x, self.sample_ht_x)
+        np.save(self.filepath_y, self.sample_ht_y)
+        np.save(self.filepath_z, self.sample_ht_z)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_girf_initialization_valid(self):
+        girf = GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, 
+                      self.valid_dt_girf, name=self.test_girf_name)
+        
+        self.assertTrue(np.array_equal(girf.h_t_x, self.sample_ht_x))
+        self.assertTrue(np.array_equal(girf.h_t_y, self.sample_ht_y))
+        self.assertTrue(np.array_equal(girf.h_t_z, self.sample_ht_z))
+        self.assertEqual(girf.dt_girf, self.valid_dt_girf)
+        self.assertEqual(girf.name, self.test_girf_name)
+
+    def test_girf_initialization_default_name(self):
+        girf = GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, self.valid_dt_girf)
+        self.assertEqual(girf.name, "CustomGIRF")
+
+
+    def test_girf_initialization_invalid_dt(self):
+        with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
+            GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, dt_girf=0)
+        with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
+            GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, dt_girf=-1e-6)
+
+    def test_girf_initialization_invalid_ht_dims(self):
+        ht_2d = np.array([[0.1, 0.2], [0.3, 0.4]])
+        with self.assertRaisesRegex(ValueError, "h_t_x must be a 1D array"):
+            GIRF(ht_2d, self.sample_ht_y, self.sample_ht_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(ValueError, "h_t_y must be a 1D array"):
+            GIRF(self.sample_ht_x, ht_2d, self.sample_ht_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(ValueError, "h_t_z must be a 1D array"):
+            GIRF(self.sample_ht_x, self.sample_ht_y, ht_2d, self.valid_dt_girf)
+
+    def test_girf_repr_method(self):
+        girf = GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, 
+                      self.valid_dt_girf, name=self.test_girf_name)
+        expected_repr = (f"GIRF(name='{self.test_girf_name}', dt_girf={self.valid_dt_girf:.2e}, "
+                         f"x_len={len(self.sample_ht_x)}, y_len={len(self.sample_ht_y)}, "
+                         f"z_len={len(self.sample_ht_z)})")
+        self.assertEqual(repr(girf), expected_repr)
+
+        girf_no_name = GIRF(self.sample_ht_x, self.sample_ht_y, self.sample_ht_z, self.valid_dt_girf)
+        expected_repr_no_name = (f"GIRF(name='CustomGIRF', dt_girf={self.valid_dt_girf:.2e}, "
+                                 f"x_len={len(self.sample_ht_x)}, y_len={len(self.sample_ht_y)}, "
+                                 f"z_len={len(self.sample_ht_z)})")
+        self.assertEqual(repr(girf_no_name), expected_repr_no_name)
+
+
+    def test_from_files_successful_load_with_name(self):
+        girf = GIRF.from_files(self.filepath_x, self.filepath_y, self.filepath_z,
+                               self.valid_dt_girf, name="LoadedGIRF")
+        self.assertIsInstance(girf, GIRF)
+        self.assertTrue(np.array_equal(girf.h_t_x, self.sample_ht_x))
+        self.assertTrue(np.array_equal(girf.h_t_y, self.sample_ht_y))
+        self.assertTrue(np.array_equal(girf.h_t_z, self.sample_ht_z))
+        self.assertEqual(girf.dt_girf, self.valid_dt_girf)
+        self.assertEqual(girf.name, "LoadedGIRF")
+
+    def test_from_files_successful_load_auto_name(self):
+        # Test default name generation
+        # Assuming filenames are 'girf_x.npy', 'girf_y.npy', 'girf_z.npy'
+        # The auto-name logic should produce 'girf'
+        girf_auto_name = GIRF.from_files(self.filepath_x, self.filepath_y, self.filepath_z,
+                                         self.valid_dt_girf)
+        self.assertEqual(girf_auto_name.name, "girf")
+
+        # Test with more complex names that share a prefix
+        path_prefix_x = os.path.join(self.temp_dir, 'systemA_profile_x.npy')
+        path_prefix_y = os.path.join(self.temp_dir, 'systemA_profile_y.npy')
+        path_prefix_z = os.path.join(self.temp_dir, 'systemA_profile_z.npy')
+        np.save(path_prefix_x, self.sample_ht_x)
+        np.save(path_prefix_y, self.sample_ht_y)
+        np.save(path_prefix_z, self.sample_ht_z)
+        girf_prefix_name = GIRF.from_files(path_prefix_x, path_prefix_y, path_prefix_z, self.valid_dt_girf)
+        self.assertEqual(girf_prefix_name.name, "systemA_profile")
+
+        # Test with dissimilar names (fallback)
+        path_dissimilar_x = os.path.join(self.temp_dir, 'alpha_data_x.npy')
+        path_dissimilar_y = os.path.join(self.temp_dir, 'beta_samples_y.npy')
+        path_dissimilar_z = os.path.join(self.temp_dir, 'gamma_set_z.npy')
+        np.save(path_dissimilar_x, self.sample_ht_x)
+        np.save(path_dissimilar_y, self.sample_ht_y)
+        np.save(path_dissimilar_z, self.sample_ht_z)
+        girf_dissimilar_name = GIRF.from_files(path_dissimilar_x, path_dissimilar_y, path_dissimilar_z, self.valid_dt_girf)
+        self.assertEqual(girf_dissimilar_name.name, "GIRF_alpha") # "GIRF_" + first 5 chars of x basename
+
+
+    def test_from_files_file_not_found(self):
+        non_existent_file = os.path.join(self.temp_dir, "non_existent.npy")
+        with self.assertRaisesRegex(FileNotFoundError, f"Could not load GIRF data: {non_existent_file} not found."):
+            GIRF.from_files(non_existent_file, self.filepath_y, self.filepath_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(FileNotFoundError, f"Could not load GIRF data: {non_existent_file} not found."):
+            GIRF.from_files(self.filepath_x, non_existent_file, self.filepath_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(FileNotFoundError, f"Could not load GIRF data: {non_existent_file} not found."):
+            GIRF.from_files(self.filepath_x, self.filepath_y, non_existent_file, self.valid_dt_girf)
+
+    def test_from_files_invalid_npy_file(self):
+        invalid_npy_file = os.path.join(self.temp_dir, "invalid.npy")
+        with open(invalid_npy_file, 'w') as f:
+            f.write("This is not a numpy file.")
+        
+        with self.assertRaisesRegex(ValueError, "Error loading GIRF data from .npy files"):
+            GIRF.from_files(invalid_npy_file, self.filepath_y, self.filepath_z, self.valid_dt_girf)
+
+    def test_from_files_invalid_ht_dims_in_file(self):
+        ht_2d = np.array([[0.1, 0.2], [0.3, 0.4]])
+        filepath_2d = os.path.join(self.temp_dir, "ht_2d.npy")
+        np.save(filepath_2d, ht_2d)
+
+        with self.assertRaisesRegex(ValueError, f"h_t_x from {filepath_2d} must be a 1D array"):
+            GIRF.from_files(filepath_2d, self.filepath_y, self.filepath_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(ValueError, f"h_t_y from {filepath_2d} must be a 1D array"):
+            GIRF.from_files(self.filepath_x, filepath_2d, self.filepath_z, self.valid_dt_girf)
+        with self.assertRaisesRegex(ValueError, f"h_t_z from {filepath_2d} must be a 1D array"):
+            GIRF.from_files(self.filepath_x, self.filepath_y, filepath_2d, self.valid_dt_girf)
+
+    def test_from_files_invalid_dt(self):
+        with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
+            GIRF.from_files(self.filepath_x, self.filepath_y, self.filepath_z, dt_girf=0)
+
+
+from trajgen import apply_girf_convolution # Import the function to be tested
+
+class TestApplyGirfConvolution(unittest.TestCase):
+    def setUp(self):
+        self.dt_std = 1e-5 # Standard dt for many tests
+        self.grad_wave_simple = np.array([0., 0., 1., 0., 0.]) # Simple impulse
+        self.girf_delta_1pt = np.array([1.0])
+        self.girf_delta_3pt = np.array([0., 1., 0.])
+        self.girf_boxcar_3pt = np.array([1/3., 1/3., 1/3.]) # Normalized boxcar
+
+    def test_convolution_input_validation(self):
+        grad_2d = np.array([[1,2,3],[4,5,6]])
+        girf_2d = np.array([[0.1],[0.1]])
+
+        with self.assertRaisesRegex(ValueError, "gradient_waveform_1d must be a 1D NumPy array"):
+            apply_girf_convolution(grad_2d, self.girf_delta_1pt, self.dt_std, self.dt_std)
+        with self.assertRaisesRegex(ValueError, "girf_h_t_1d must be a 1D NumPy array"):
+            apply_girf_convolution(self.grad_wave_simple, girf_2d, self.dt_std, self.dt_std)
+        
+        with self.assertRaisesRegex(ValueError, "dt_gradient must be positive"):
+            apply_girf_convolution(self.grad_wave_simple, self.girf_delta_1pt, 0, self.dt_std)
+        with self.assertRaisesRegex(ValueError, "dt_gradient must be positive"):
+            apply_girf_convolution(self.grad_wave_simple, self.girf_delta_1pt, -1e-5, self.dt_std)
+            
+        with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
+            apply_girf_convolution(self.grad_wave_simple, self.girf_delta_1pt, self.dt_std, 0)
+        with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
+            apply_girf_convolution(self.grad_wave_simple, self.girf_delta_1pt, self.dt_std, -1e-5)
+
+    def test_convolution_empty_inputs(self):
+        empty_arr = np.array([])
+        self.assertTrue(np.array_equal(apply_girf_convolution(empty_arr, self.girf_delta_1pt, self.dt_std, self.dt_std), empty_arr))
+        self.assertTrue(np.array_equal(apply_girf_convolution(self.grad_wave_simple, empty_arr, self.dt_std, self.dt_std), empty_arr))
+        self.assertTrue(np.array_equal(apply_girf_convolution(empty_arr, empty_arr, self.dt_std, self.dt_std), empty_arr))
+
+    def test_convolution_same_dt(self):
+        # Delta GIRF [1.0]
+        out_delta1 = apply_girf_convolution(self.grad_wave_simple, self.girf_delta_1pt, self.dt_std, self.dt_std)
+        self.assertEqual(out_delta1.shape, self.grad_wave_simple.shape)
+        np.testing.assert_allclose(out_delta1, self.grad_wave_simple, atol=1e-7, err_msg="Delta GIRF [1.0] failed")
+
+        # Delta GIRF [0, 1, 0] - should be identical as mode='same' centers it
+        out_delta3 = apply_girf_convolution(self.grad_wave_simple, self.girf_delta_3pt, self.dt_std, self.dt_std)
+        self.assertEqual(out_delta3.shape, self.grad_wave_simple.shape)
+        np.testing.assert_allclose(out_delta3, self.grad_wave_simple, atol=1e-7, err_msg="Delta GIRF [0,1,0] failed")
+
+        # Boxcar GIRF [1/3, 1/3, 1/3]
+        # Expected output for [0,0,1,0,0] convolved with [1/3,1/3,1/3] mode='same'
+        # Convolution:
+        # idx 0 (0): 0*1/3 (center) + 0*1/3 (left) + 0*1/3 (right from padding) = 0
+        # idx 1 (0): 0*1/3 (center) + 0*1/3 (left) + 1*1/3 (right) = 1/3
+        # idx 2 (1): 1*1/3 (center) + 0*1/3 (left) + 0*1/3 (right) = 1/3
+        # idx 3 (0): 0*1/3 (center) + 1*1/3 (left) + 0*1/3 (right) = 1/3
+        # idx 4 (0): 0*1/3 (center) + 0*1/3 (left) + 0*1/3 (right from padding) = 0
+        expected_boxcar_out = np.array([0., 1/3., 1/3., 1/3., 0.])
+        out_boxcar = apply_girf_convolution(self.grad_wave_simple, self.girf_boxcar_3pt, self.dt_std, self.dt_std)
+        self.assertEqual(out_boxcar.shape, self.grad_wave_simple.shape)
+        np.testing.assert_allclose(out_boxcar, expected_boxcar_out, atol=1e-7, err_msg="Boxcar GIRF failed")
+
+    def test_convolution_different_dt_resample_girf(self):
+        gradient_long = np.zeros(100)
+        gradient_long[50] = 1.0 # Impulse in a longer waveform
+        
+        girf_short_boxcar = np.array([0.25, 0.25, 0.25, 0.25]) # Sums to 1
+
+        # Upsampling GIRF (dt_gradient < dt_girf, so more samples in resampled GIRF for same duration)
+        dt_grad_fast = 1e-5
+        dt_girf_slow = 4e-5
+        # GIRF duration = (4-1)*4e-5 = 12e-5. Resampled GIRF samples = 12e-5 / 1e-5 + 1 = 13
+        out_upsample = apply_girf_convolution(gradient_long, girf_short_boxcar, dt_grad_fast, dt_girf_slow)
+        self.assertEqual(out_upsample.shape, gradient_long.shape)
+        # Check if sum of output is close to sum of gradient (since GIRF sums to 1)
+        self.assertAlmostEqual(np.sum(out_upsample), np.sum(gradient_long), places=6, msg="Sum changed on GIRF upsampling")
+
+        # Downsampling GIRF (dt_gradient > dt_girf, so fewer samples in resampled GIRF)
+        dt_grad_slow = 5e-5
+        dt_girf_fast = 1e-5
+        # GIRF (original) = [0.25]*4, dt=1e-5. Duration = (4-1)*1e-5 = 3e-5.
+        # Resampled GIRF samples = 3e-5 / 5e-5 + 1 = 0.6 + 1 = 1.6 -> round(1.6)=2 samples.
+        # Target time vector = [0, 5e-5]. Original time = [0, 1e-5, 2e-5, 3e-5]
+        out_downsample = apply_girf_convolution(gradient_long, girf_short_boxcar, dt_grad_slow, dt_girf_fast)
+        self.assertEqual(out_downsample.shape, gradient_long.shape)
+        self.assertAlmostEqual(np.sum(out_downsample), np.sum(gradient_long), places=6, msg="Sum changed on GIRF downsampling")
+
+    def test_convolution_normalization_effect(self):
+        gradient_impulse = np.array([0., 0., 1., 0., 0.])
+        girf_unnorm = np.array([0.5, 0.5, 0.5]) # Sums to 1.5
+        
+        dt_grad = 1e-5
+        dt_girf = 2e-5 # Trigger resampling
+
+        # The effective GIRF used in convolution should maintain the sum of 1.5
+        # Convolution of an impulse with a kernel results in the kernel shape scaled by impulse height
+        # Sum of output = sum(gradient) * sum(effective_kernel)
+        output = apply_girf_convolution(gradient_impulse, girf_unnorm, dt_grad, dt_girf)
+        self.assertAlmostEqual(np.sum(output), np.sum(gradient_impulse) * np.sum(girf_unnorm), places=6)
+        
+        # Test with a GIRF that sums to 0
+        girf_sum_zero = np.array([-0.5, 1.0, -0.5]) # Sums to 0
+        output_sum_zero = apply_girf_convolution(gradient_impulse, girf_sum_zero, dt_grad, dt_girf)
+        self.assertAlmostEqual(np.sum(output_sum_zero), 0.0, places=6)
+
+
+    def test_convolution_short_girf_resampling(self):
+        # Case 1: Resampled GIRF becomes effectively a single point, sum preserved
+        grad_wave = np.array([0,0,1,0,0], dtype=float)
+        girf_single_point = np.array([2.0]) # Sums to 2.0
+        dt_g = 1e-3
+        dt_h = 1e-6 # GIRF is very short, duration 0.
+        # Original GIRF duration = 0. Resampled GIRF samples = len(girf_h_t_1d) = 1.
+        # t_girf_target = [0]. Resampled GIRF = [2.0]. Sums are preserved.
+        # Convolution with [2.0] (delta scaled) should scale the input.
+        output = apply_girf_convolution(grad_wave, girf_single_point, dt_g, dt_h)
+        np.testing.assert_allclose(output, grad_wave * 2.0, atol=1e-7)
+
+        # Case 2: GIRF is two points, duration dt_girf. Resampled to 1 point if dt_girf < dt_gradient/2
+        girf_two_points = np.array([1.0, 1.0]) # Sums to 2.0
+        dt_g_long = 1e-2
+        dt_h_short = 1e-6 # Duration = 1e-6
+        # original_girf_duration = 1e-6. num_target_samples = round(1e-6/1e-2)+1 = 1.
+        # t_girf_target = [0].
+        # interp([0], [0, 1e-6], [1,1]) -> [1.0]
+        # sum_original = 2.0. sum_resampled = 1.0. Factor = 2.0. Resampled = [2.0]
+        output2 = apply_girf_convolution(grad_wave, girf_two_points, dt_g_long, dt_h_short)
+        np.testing.assert_allclose(output2, grad_wave * 2.0, atol=1e-7)
+
+        # Case where resampled GIRF might become empty (though current code tries to avoid this)
+        # This test targets the `if girf_h_t_to_use.size == 0: return np.zeros_like(...)`
+        # To hit this, `num_target_samples` in resampling must result in an empty `t_girf_target`
+        # or `np.interp` must return empty. The current code makes `num_target_samples` at least 1.
+        # So, this specific branch is hard to hit unless `np.interp` itself returns empty for some reason
+        # not covered by current understanding.
+        # Let's check if a GIRF that sums to zero and is very short, becomes all zeros.
+        girf_bipolar_short = np.array([1.0, -1.0]) # sums to 0
+        # if resampled to one point, interp([0], [0, 1e-6], [1,-1]) -> 1.0. sum_orig=0, sum_resamp=1. scaled by 0/1 -> [0]
+        output3 = apply_girf_convolution(grad_wave, girf_bipolar_short, dt_g_long, dt_h_short)
+        np.testing.assert_allclose(output3, np.zeros_like(grad_wave), atol=1e-7)
+
+
 if __name__ == '__main__':
     unittest.main()
