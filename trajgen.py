@@ -1984,4 +1984,3 @@ def reconstruct_image(kspace_data: np.ndarray,
     if verbose: print("Image reconstruction complete.")
     
     return image_magnitude
->>>>>>> REPLACE
