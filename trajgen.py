@@ -1729,6 +1729,125 @@ def generate_radial_trajectory(num_spokes: int,
                       metadata=metadata)
 
 
+def generate_golden_angle_3d_trajectory(num_points: int,
+                                        fov_m: float | tuple[float, float, float] | list[float],
+                                        max_k_rad_per_m: Optional[float | tuple[float, float, float] | list[float]] = None,
+                                        name: str = "golden_angle_3d",
+                                        dt_seconds: float = 4e-6) -> Trajectory:
+    """
+    Generates a 3D k-space trajectory using the Golden Angle (Phyllotaxis spiral) method.
+
+    This method distributes points approximately uniformly on the surface of spheres
+    of varying radii, or on ellipsoids if max_k_rad_per_m is anisotropic.
+
+    Args:
+        num_points (int): Total number of k-space points to generate.
+        fov_m (float | tuple/list of 3 floats): Field of View in meters.
+            If a single float, isotropic FOV is assumed.
+            If a tuple/list of 3 floats (fov_x, fov_y, fov_z), anisotropic FOV is used.
+        max_k_rad_per_m (Optional float | tuple/list of 3 floats): Maximum k-space extent
+            in rad/m. If a single float, isotropic k-max is assumed.
+            If a tuple/list (kmax_x, kmax_y, kmax_z), anisotropic k-max is applied.
+            If None, it's calculated as np.pi / fov_m for each dimension.
+        name (str, optional): Name for the trajectory. Defaults to "golden_angle_3d".
+        dt_seconds (float, optional): Dwell time for the trajectory. Defaults to 4e-6.
+
+    Returns:
+        Trajectory: The generated 3D Golden Angle trajectory.
+    """
+    if num_points <= 0:
+        k_space_points = np.empty((3, 0))
+        k_max_calculated_rad_m_xyz_final = (0.0, 0.0, 0.0)
+        gen_params = {
+            'traj_type': 'golden_angle_3d',
+            'num_points': num_points,
+            'fov_m_input': fov_m,
+            'max_k_rad_per_m_input': max_k_rad_per_m,
+            'dt_seconds_input': dt_seconds
+        }
+        metadata = {
+            'generator_params': gen_params,
+            'k_max_calculated_rad_m_xyz': k_max_calculated_rad_m_xyz_final
+        }
+        return Trajectory(name=name,
+                          kspace_points_rad_per_m=k_space_points,
+                          dt_seconds=dt_seconds,
+                          metadata=metadata)
+
+    # Determine k_max for each dimension
+    if max_k_rad_per_m is None:
+        if isinstance(fov_m, (float, int)):
+            k_max_x = k_max_y = k_max_z = np.pi / float(fov_m)
+        elif isinstance(fov_m, (list, tuple)) and len(fov_m) == 3:
+            k_max_x = np.pi / float(fov_m[0])
+            k_max_y = np.pi / float(fov_m[1])
+            k_max_z = np.pi / float(fov_m[2])
+        else:
+            raise ValueError("fov_m must be a float or a list/tuple of 3 floats.")
+    else:
+        if isinstance(max_k_rad_per_m, (float, int)):
+            k_max_x = k_max_y = k_max_z = float(max_k_rad_per_m)
+        elif isinstance(max_k_rad_per_m, (list, tuple)) and len(max_k_rad_per_m) == 3:
+            k_max_x = float(max_k_rad_per_m[0])
+            k_max_y = float(max_k_rad_per_m[1])
+            k_max_z = float(max_k_rad_per_m[2])
+        else:
+            raise ValueError("max_k_rad_per_m must be a float or a list/tuple of 3 floats, or None.")
+
+    k_max_calculated_rad_m_xyz_final = (k_max_x, k_max_y, k_max_z)
+
+    # Golden Angle constants
+    inc = np.pi * (3. - np.sqrt(5.))  # Golden angle increment
+    
+    k_space_points = np.zeros((3, num_points))
+
+    for i in range(num_points):
+        # Normalized radius, ensuring points fill the volume
+        # (i + 0.5) / num_points ensures r_norm ranges from near 0 to near 1
+        r_norm = np.power((i + 0.5) / num_points, 1./3.)
+
+        # Spherical coordinates based on Phyllotaxis spiral
+        # k corresponds to z-coordinate before scaling (normalized from -1 to 1)
+        # Offset ensures points are symmetric around the equator for z
+        offset = 2. / num_points if num_points > 0 else 0.
+        k_z_norm_sphere = ((i * offset) - 1.) + (offset / 2.) 
+        if abs(k_z_norm_sphere) > 1: # Clamp due to potential floating point issues for i=0 or i=N-1
+            k_z_norm_sphere = np.sign(k_z_norm_sphere)
+
+        theta = np.arccos(k_z_norm_sphere)  # Polar angle (from z-axis)
+        phi = (i % num_points) * inc       # Azimuthal angle, wraps around due to % (though i is already 0 to N-1)
+                                           # More standard: phi = i * inc
+
+        # Convert spherical (normalized radius, theta, phi) to Cartesian (normalized)
+        # These are coordinates on a unit sphere, scaled by r_norm
+        kx_norm = r_norm * np.sin(theta) * np.cos(phi)
+        ky_norm = r_norm * np.sin(theta) * np.sin(phi)
+        kz_norm = r_norm * np.cos(theta) # which is r_norm * k_z_norm_sphere (if theta derived from k_z_norm_sphere)
+
+        # Scale by anisotropic k_max
+        k_space_points[0, i] = kx_norm * k_max_x
+        k_space_points[1, i] = ky_norm * k_max_y
+        k_space_points[2, i] = kz_norm * k_max_z
+        
+    gen_params = {
+        'traj_type': 'golden_angle_3d',
+        'num_points': num_points,
+        'fov_m_input': fov_m,
+        'max_k_rad_per_m_input': max_k_rad_per_m, # Store what was passed
+        'dt_seconds_input': dt_seconds
+    }
+    
+    metadata = {
+        'generator_params': gen_params,
+        'k_max_calculated_rad_m_xyz': k_max_calculated_rad_m_xyz_final
+    }
+
+    return Trajectory(name=name,
+                      kspace_points_rad_per_m=k_space_points,
+                      dt_seconds=dt_seconds,
+                      metadata=metadata)
+
+
 def constrain_trajectory(trajectory: Trajectory, 
                          max_gradient_Tm_per_m: float, 
                          max_slew_rate_Tm_per_m_per_s: float, 

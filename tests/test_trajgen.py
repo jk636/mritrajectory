@@ -593,11 +593,177 @@ from trajgen import (
     compute_voronoi_density,
     generate_spiral_trajectory,
     generate_radial_trajectory,
+    generate_golden_angle_3d_trajectory, # Added import
     constrain_trajectory,
     reconstruct_image,
     display_trajectory
 )
 from unittest.mock import patch # For display_trajectory tests
+
+
+class TestGenerateGoldenAngle3DTrajectory(unittest.TestCase):
+    def setUp(self):
+        self.default_dt = 4e-6
+        self.num_points_default = 100
+
+    def test_basic_generation_isotropic_fov(self):
+        num_points = self.num_points_default
+        fov_m = 0.25  # Isotropic FOV
+        traj_name = "golden_angle_iso_fov"
+
+        traj = generate_golden_angle_3d_trajectory(num_points, fov_m, name=traj_name, dt_seconds=self.default_dt)
+
+        self.assertIsInstance(traj, Trajectory)
+        self.assertEqual(traj.name, traj_name)
+        self.assertEqual(traj.get_num_points(), num_points)
+        self.assertEqual(traj.get_num_dimensions(), 3)
+        self.assertEqual(traj.kspace_points_rad_per_m.shape, (3, num_points))
+        self.assertEqual(traj.dt_seconds, self.default_dt)
+
+        expected_k_max = np.pi / fov_m
+        expected_k_max_xyz = (expected_k_max, expected_k_max, expected_k_max)
+
+        self.assertIn('generator_params', traj.metadata)
+        gp = traj.metadata['generator_params']
+        self.assertEqual(gp['num_points'], num_points)
+        self.assertEqual(gp['fov_m_input'], fov_m)
+        self.assertIsNone(gp['max_k_rad_per_m_input']) # Was not provided
+        self.assertEqual(gp['dt_seconds_input'], self.default_dt)
+
+        self.assertIn('k_max_calculated_rad_m_xyz', traj.metadata)
+        for i in range(3):
+            self.assertAlmostEqual(traj.metadata['k_max_calculated_rad_m_xyz'][i], expected_k_max_xyz[i], places=6)
+
+        # Check k-space points are within bounds
+        # For Golden Angle, points are distributed within an ellipsoidal volume.
+        # Max extent along each axis should be within calculated k_max for that axis.
+        for dim in range(3):
+            self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[dim, :])) <= expected_k_max_xyz[dim] * 1.001) # Allow small tolerance
+
+    def test_generation_anisotropic_fov(self):
+        num_points = self.num_points_default
+        fov_m_aniso = (0.2, 0.3, 0.4) # Anisotropic FOV (x, y, z)
+        traj_name = "golden_angle_aniso_fov"
+
+        traj = generate_golden_angle_3d_trajectory(num_points, fov_m_aniso, name=traj_name)
+
+        self.assertIsInstance(traj, Trajectory)
+        self.assertEqual(traj.name, traj_name)
+        self.assertEqual(traj.get_num_points(), num_points)
+        self.assertEqual(traj.get_num_dimensions(), 3)
+        self.assertEqual(traj.kspace_points_rad_per_m.shape, (3, num_points))
+
+        expected_k_max_x = np.pi / fov_m_aniso[0]
+        expected_k_max_y = np.pi / fov_m_aniso[1]
+        expected_k_max_z = np.pi / fov_m_aniso[2]
+        expected_k_max_xyz = (expected_k_max_x, expected_k_max_y, expected_k_max_z)
+
+        self.assertIn('generator_params', traj.metadata)
+        gp = traj.metadata['generator_params']
+        self.assertEqual(gp['fov_m_input'], fov_m_aniso)
+
+        self.assertIn('k_max_calculated_rad_m_xyz', traj.metadata)
+        km_calc = traj.metadata['k_max_calculated_rad_m_xyz']
+        self.assertAlmostEqual(km_calc[0], expected_k_max_xyz[0], places=6)
+        self.assertAlmostEqual(km_calc[1], expected_k_max_xyz[1], places=6)
+        self.assertAlmostEqual(km_calc[2], expected_k_max_xyz[2], places=6)
+
+        # Check k-space points are within bounds for each dimension
+        self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[0, :])) <= expected_k_max_xyz[0] * 1.001)
+        self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[1, :])) <= expected_k_max_xyz[1] * 1.001)
+        self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[2, :])) <= expected_k_max_xyz[2] * 1.001)
+
+    def test_generation_explicit_isotropic_max_k(self):
+        num_points = self.num_points_default
+        fov_m = 0.2 # This will be ignored for k_max calculation if max_k_rad_per_m is given
+        explicit_k_max_iso = 100.0
+        
+        traj = generate_golden_angle_3d_trajectory(num_points, fov_m, max_k_rad_per_m=explicit_k_max_iso)
+
+        self.assertIsInstance(traj, Trajectory)
+        expected_k_max_xyz = (explicit_k_max_iso, explicit_k_max_iso, explicit_k_max_iso)
+
+        gp = traj.metadata['generator_params']
+        self.assertEqual(gp['max_k_rad_per_m_input'], explicit_k_max_iso)
+        km_calc = traj.metadata['k_max_calculated_rad_m_xyz']
+        for i in range(3):
+            self.assertAlmostEqual(km_calc[i], expected_k_max_xyz[i], places=6)
+
+        for dim in range(3):
+            self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[dim, :])) <= expected_k_max_xyz[dim] * 1.001)
+
+    def test_generation_explicit_anisotropic_max_k(self):
+        num_points = self.num_points_default
+        fov_m = 0.25 # Ignored for k_max calculation
+        explicit_k_max_aniso = (100.0, 120.0, 150.0)
+
+        traj = generate_golden_angle_3d_trajectory(num_points, fov_m, max_k_rad_per_m=explicit_k_max_aniso)
+        
+        self.assertIsInstance(traj, Trajectory)
+        gp = traj.metadata['generator_params']
+        self.assertEqual(gp['max_k_rad_per_m_input'], explicit_k_max_aniso)
+        km_calc = traj.metadata['k_max_calculated_rad_m_xyz']
+        for i in range(3):
+            self.assertAlmostEqual(km_calc[i], explicit_k_max_aniso[i], places=6)
+
+        for dim in range(3):
+            self.assertTrue(np.max(np.abs(traj.kspace_points_rad_per_m[dim, :])) <= explicit_k_max_aniso[dim] * 1.001)
+
+    def test_edge_case_small_num_points(self):
+        fov_m = 0.3
+        
+        # Test with num_points = 1
+        traj_one_point = generate_golden_angle_3d_trajectory(1, fov_m)
+        self.assertEqual(traj_one_point.get_num_points(), 1)
+        self.assertEqual(traj_one_point.kspace_points_rad_per_m.shape, (3, 1))
+        # The single point should be close to k=0.
+        # r_norm = (0.5/1)^(1/3) = 0.5^(1/3) approx 0.79
+        # k_z_norm_sphere = (0*2/1 - 1) + (2/1 / 2) = -1 + 1 = 0
+        # theta = acos(0) = pi/2. So kz is 0.
+        # phi = 0 * inc = 0.
+        # kx_norm = r_norm * sin(pi/2) * cos(0) = r_norm * 1 * 1 = r_norm
+        # ky_norm = r_norm * sin(pi/2) * sin(0) = r_norm * 1 * 0 = 0
+        # So, point should be (r_norm * k_max_x, 0, 0)
+        expected_k_max = np.pi / fov_m
+        r_norm_one_pt = np.power(0.5, 1./3.)
+        expected_k_point = np.array([[r_norm_one_pt * expected_k_max], [0.0], [0.0]])
+        np.testing.assert_allclose(traj_one_point.kspace_points_rad_per_m, expected_k_point, atol=1e-6)
+
+        # Test with num_points = 0
+        traj_zero_points = generate_golden_angle_3d_trajectory(0, fov_m)
+        self.assertEqual(traj_zero_points.get_num_points(), 0)
+        self.assertEqual(traj_zero_points.kspace_points_rad_per_m.shape, (3, 0))
+        # Check metadata for k_max_calculated in case of 0 points
+        km_calc_zero = traj_zero_points.metadata['k_max_calculated_rad_m_xyz']
+        self.assertEqual(km_calc_zero, (0.0, 0.0, 0.0))
+
+
+    def test_metadata_name_dt_seconds(self):
+        num_points = 10
+        fov_m = 0.2
+        custom_name = "my_golden_angle_test"
+        custom_dt = 10e-6
+
+        traj = generate_golden_angle_3d_trajectory(num_points, fov_m, name=custom_name, dt_seconds=custom_dt)
+        
+        self.assertEqual(traj.name, custom_name)
+        self.assertEqual(traj.dt_seconds, custom_dt)
+        self.assertIn('generator_params', traj.metadata)
+        gp = traj.metadata['generator_params']
+        self.assertEqual(gp['dt_seconds_input'], custom_dt)
+
+    def test_invalid_fov_input(self):
+        with self.assertRaisesRegex(ValueError, "fov_m must be a float or a list/tuple of 3 floats"):
+            generate_golden_angle_3d_trajectory(10, fov_m=(0.1, 0.2)) # Incorrect tuple length
+        with self.assertRaisesRegex(ValueError, "fov_m must be a float or a list/tuple of 3 floats"):
+            generate_golden_angle_3d_trajectory(10, fov_m="not_a_fov")
+
+    def test_invalid_max_k_input(self):
+        with self.assertRaisesRegex(ValueError, "max_k_rad_per_m must be a float or a list/tuple of 3 floats, or None"):
+            generate_golden_angle_3d_trajectory(10, fov_m=0.2, max_k_rad_per_m=(100, 120)) # Incorrect tuple length
+        with self.assertRaisesRegex(ValueError, "max_k_rad_per_m must be a float or a list/tuple of 3 floats, or None"):
+            generate_golden_angle_3d_trajectory(10, fov_m=0.2, max_k_rad_per_m="not_k_max")
+
 
 class TestAdvancedTrajectoryTools(unittest.TestCase):
     def setUp(self):
@@ -962,6 +1128,80 @@ class TestAdvancedTrajectoryTools(unittest.TestCase):
         k_points_exp_k = traj_explicit_k.kspace_points_rad_per_m
         radii_exp_k = np.sqrt(k_points_exp_k[0,:]**2 + k_points_exp_k[1,:]**2)
         self.assertTrue(np.max(radii_exp_k) <= explicit_k_max * 1.001)
+
+    def test_generate_spiral_edge_cases(self):
+        fov = 0.2
+        default_dt = self.dt_s # from setUp of TestAdvancedTrajectoryTools
+
+        # Test with num_arms = 1, num_samples_per_arm = 1
+        with self.subTest(case="1arm_1sample"):
+            traj = generate_spiral_trajectory(num_arms=1, num_samples_per_arm=1, fov_m=fov, dt_seconds=default_dt)
+            self.assertIsInstance(traj, Trajectory)
+            self.assertEqual(traj.get_num_points(), 1)
+            self.assertEqual(traj.get_num_dimensions(), 2)
+            self.assertEqual(traj.kspace_points_rad_per_m.shape, (2, 1))
+            
+            k_max_expected = np.pi / fov
+            # For num_samples_per_arm = 1, t_sample = 1.0. current_radius = k_max.
+            # angle_offset = 0 for first arm.
+            # current_angle = 0 + effective_revolutions * 2 * np.pi.
+            # Default effective_revolutions = 10.0. cos(10*2pi)=1, sin(10*2pi)=0.
+            # So point should be (k_max, 0)
+            expected_k_point = np.array([[k_max_expected], [0.0]])
+            np.testing.assert_allclose(traj.kspace_points_rad_per_m, expected_k_point, atol=1e-6)
+            self.assertIn('generator_params', traj.metadata)
+            self.assertEqual(traj.metadata['generator_params']['num_arms'], 1)
+            self.assertEqual(traj.metadata['generator_params']['num_samples_per_arm'], 1)
+
+        # Test with num_arms = 0 (total points = 0)
+        with self.subTest(case="0arms"):
+            traj_zero_arms = generate_spiral_trajectory(num_arms=0, num_samples_per_arm=100, fov_m=fov, dt_seconds=default_dt)
+            self.assertEqual(traj_zero_arms.get_num_points(), 0)
+            self.assertEqual(traj_zero_arms.kspace_points_rad_per_m.shape, (2, 0))
+            self.assertIn('generator_params', traj_zero_arms.metadata)
+            self.assertEqual(traj_zero_arms.metadata['generator_params']['num_arms'], 0)
+
+        # Test with num_samples_per_arm = 0 (total points = 0)
+        with self.subTest(case="0samples_per_arm"):
+            traj_zero_samples = generate_spiral_trajectory(num_arms=4, num_samples_per_arm=0, fov_m=fov, dt_seconds=default_dt)
+            self.assertEqual(traj_zero_samples.get_num_points(), 0)
+            self.assertEqual(traj_zero_samples.kspace_points_rad_per_m.shape, (2, 0))
+            self.assertIn('generator_params', traj_zero_samples.metadata)
+            self.assertEqual(traj_zero_samples.metadata['generator_params']['num_samples_per_arm'], 0)
+
+    def test_generate_radial_edge_cases(self):
+        fov = 0.25
+        default_dt = self.dt_s
+
+        # Test with num_spokes = 1, num_samples_per_spoke = 1
+        with self.subTest(case="1spoke_1sample"):
+            traj = generate_radial_trajectory(num_spokes=1, num_samples_per_spoke=1, fov_m=fov, dt_seconds=default_dt)
+            self.assertIsInstance(traj, Trajectory)
+            self.assertEqual(traj.get_num_points(), 1)
+            self.assertEqual(traj.get_num_dimensions(), 2)
+            self.assertEqual(traj.kspace_points_rad_per_m.shape, (2, 1))
+            # For num_samples_per_spoke = 1, k_radii = np.array([0.0]). So point is (0,0).
+            expected_k_point = np.array([[0.0], [0.0]])
+            np.testing.assert_allclose(traj.kspace_points_rad_per_m, expected_k_point, atol=1e-7)
+            self.assertIn('generator_params', traj.metadata)
+            self.assertEqual(traj.metadata['generator_params']['num_spokes'], 1)
+            self.assertEqual(traj.metadata['generator_params']['num_samples_per_spoke'], 1)
+
+        # Test with num_spokes = 0 (total points = 0)
+        with self.subTest(case="0spokes"):
+            traj_zero_spokes = generate_radial_trajectory(num_spokes=0, num_samples_per_spoke=64, fov_m=fov, dt_seconds=default_dt)
+            self.assertEqual(traj_zero_spokes.get_num_points(), 0)
+            self.assertEqual(traj_zero_spokes.kspace_points_rad_per_m.shape, (2, 0))
+            self.assertIn('generator_params', traj_zero_spokes.metadata)
+            self.assertEqual(traj_zero_spokes.metadata['generator_params']['num_spokes'], 0)
+
+        # Test with num_samples_per_spoke = 0 (total points = 0)
+        with self.subTest(case="0samples_per_spoke"):
+            traj_zero_samples = generate_radial_trajectory(num_spokes=10, num_samples_per_spoke=0, fov_m=fov, dt_seconds=default_dt)
+            self.assertEqual(traj_zero_samples.get_num_points(), 0)
+            self.assertEqual(traj_zero_samples.kspace_points_rad_per_m.shape, (2, 0))
+            self.assertIn('generator_params', traj_zero_samples.metadata)
+            self.assertEqual(traj_zero_samples.metadata['generator_params']['num_samples_per_spoke'], 0)
 
     # 6. constrain_trajectory tests
     def test_constrain_trajectory(self):
