@@ -1013,9 +1013,6 @@ def display_trajectory(trajectory_obj: Trajectory,
                     pass # plt.show() # Potentially call plt.show() here.
     
     return ax_returned
-        """
-        # ... (implementation of summary method) ...
-        pass
 
 
 def compute_density_compensation(trajectory: np.ndarray, 
