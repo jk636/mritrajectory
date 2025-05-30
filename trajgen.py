@@ -5,6 +5,9 @@ from scipy.spatial.qhull import QhullError
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import os # Added import for os module
+from scipy.special import sici
+from scipy.signal.windows import tukey
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon
 
@@ -2462,6 +2465,321 @@ def predict_actual_gradients(trajectory: Trajectory, girf: GIRF) -> np.ndarray:
     return np.array(actual_gradient_axes)
 
 
+class sGIRF:
+    """
+    Represents a spatially-dependent Gradient Impulse Response Function (sGIRF) matrix.
+    This class stores a 3x3 matrix of impulse responses, where h_ij(t) represents
+    the response on output axis i due to an input on command axis j.
+
+    Attributes:
+        h_t_matrix (np.ndarray): A 3x3 object array where each element (i,j) is a 
+                                 1D NumPy array representing h_ij(t).
+        dt_sgirf (float): Time resolution (dt) common to all impulse responses, in seconds.
+        name (Optional[str]): An optional name for the sGIRF profile.
+    """
+    def __init__(self, 
+                 h_xx_t: np.ndarray, h_xy_t: np.ndarray, h_xz_t: np.ndarray,
+                 h_yx_t: np.ndarray, h_yy_t: np.ndarray, h_yz_t: np.ndarray,
+                 h_zx_t: np.ndarray, h_zy_t: np.ndarray, h_zz_t: np.ndarray,
+                 dt_sgirf: float, name: Optional[str] = None):
+        """
+        Initializes the sGIRF object.
+
+        Args:
+            h_xx_t through h_zz_t: 1D NumPy arrays for each component of the 
+                                   sGIRF matrix (e.g., h_xy_t is response on X axis
+                                   due to Y command). All must be provided.
+            dt_sgirf (float): Time resolution of all GIRF data in seconds.
+            name (Optional[str], optional): Name for the sGIRF profile. 
+                                           Defaults to "Custom_sGIRF".
+        
+        Raises:
+            ValueError: If dt_sgirf is not positive, if any h_ij_t is not a 1D array,
+                        if h_ij_t arrays have different lengths, or if their length is 0.
+        """
+        if dt_sgirf <= 0:
+            raise ValueError("dt_sgirf must be positive.")
+        self.dt_sgirf = float(dt_sgirf)
+        self.name = name if name is not None else "Custom_sGIRF"
+
+        h_arrays = [
+            h_xx_t, h_xy_t, h_xz_t,
+            h_yx_t, h_yy_t, h_yz_t,
+            h_zx_t, h_zy_t, h_zz_t
+        ]
+        h_names = [
+            "h_xx_t", "h_xy_t", "h_xz_t",
+            "h_yx_t", "h_yy_t", "h_yz_t",
+            "h_zx_t", "h_zy_t", "h_zz_t"
+        ]
+
+        processed_h_arrays = []
+        first_len = -1
+
+        for i, h_array in enumerate(h_arrays):
+            if h_array is None: 
+                raise ValueError(f"Component {h_names[i]} must be provided.")
+            
+            arr = np.asarray(h_array)
+            if arr.ndim != 1:
+                raise ValueError(f"{h_names[i]} must be a 1D array, got ndim {arr.ndim}.")
+            if arr.size == 0:
+                raise ValueError(f"{h_names[i]} must not be an empty array (length 0).")
+
+            if i == 0:
+                first_len = arr.size
+            elif arr.size != first_len:
+                raise ValueError(f"All h_ij_t arrays must have the same length. "
+                                 f"{h_names[0]} has length {first_len}, but "
+                                 f"{h_names[i]} has length {arr.size}.")
+            processed_h_arrays.append(arr)
+        
+        self.h_t_matrix = np.empty((3,3), dtype=object)
+        self.h_t_matrix[0,0] = processed_h_arrays[0]
+        self.h_t_matrix[0,1] = processed_h_arrays[1]
+        self.h_t_matrix[0,2] = processed_h_arrays[2]
+        self.h_t_matrix[1,0] = processed_h_arrays[3]
+        self.h_t_matrix[1,1] = processed_h_arrays[4]
+        self.h_t_matrix[1,2] = processed_h_arrays[5]
+        self.h_t_matrix[2,0] = processed_h_arrays[6]
+        self.h_t_matrix[2,1] = processed_h_arrays[7]
+        self.h_t_matrix[2,2] = processed_h_arrays[8]
+        
+        self._response_len = first_len 
+
+    def __repr__(self) -> str:
+        name_str = f"'{self.name}'" if self.name else "None"
+        return (f"sGIRF(name={name_str}, dt_sgirf={self.dt_sgirf:.2e}, "
+                f"response_len={self._response_len}, shape=(3,3))")
+
+    @classmethod
+    def from_numpy_files(cls, filepaths: Dict[str, str], 
+                         dt_sgirf: float, name: Optional[str] = None) -> 'sGIRF':
+        """
+        Loads sGIRF data from .npy files for all 9 components.
+
+        Args:
+            filepaths (Dict[str, str]): Dictionary with keys 'xx', 'xy', 'xz',
+                                       'yx', 'yy', 'yz', 'zx', 'zy', 'zz'.
+                                       Values are filepaths to .npy files.
+            dt_sgirf (float): Time resolution of the GIRF data in seconds.
+            name (Optional[str], optional): Name for the sGIRF profile. 
+                                           If None, a default name is generated.
+        Returns:
+            sGIRF: An instance of the sGIRF class.
+        Raises:
+            ValueError: If not all 9 filepaths are provided, if dt_sgirf is not positive,
+                        or if files are not valid .npy or do not contain 1D arrays,
+                        or if loaded arrays have inconsistent lengths or zero length.
+            FileNotFoundError: If any specified .npy file does not exist.
+        """
+        required_keys = {'xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz'}
+        if not required_keys.issubset(filepaths.keys()):
+            missing_keys = required_keys - filepaths.keys()
+            raise ValueError(f"Missing required filepaths for sGIRF components: {missing_keys}")
+
+        h_arrays_loaded = {}
+        try:
+            for key_suffix in sorted(list(required_keys)): 
+                path = filepaths[key_suffix]
+                arr = np.load(path)
+                if arr.ndim != 1: 
+                    raise ValueError(f"Data in {path} (for {key_suffix}) is not 1D, shape: {arr.shape}")
+                h_arrays_loaded[key_suffix] = arr
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Could not load sGIRF data: {e.filename} not found.") from e
+        except Exception as e: 
+            raise ValueError(f"Error loading or validating sGIRF data from .npy files: {e}")
+
+        final_name = name
+        if final_name is None:
+            try:
+                basenames = [os.path.splitext(os.path.basename(filepaths[key]))[0] for key in sorted(filepaths.keys())]
+                common_prefix = os.path.commonprefix(basenames)
+                if len(common_prefix) > 3:
+                    potential_suffixes_to_strip = ['_xx', '_xy', '_xz', '_yx', '_yy', '_yz', '_zx', '_zy', '_zz', 
+                                                   '-xx', '-xy', '-xz', '-yx', '-yy', '-yz', '-zx', '-zy', '-zz']
+                    for sfx_to_strip in potential_suffixes_to_strip:
+                        if common_prefix.lower().endswith(sfx_to_strip):
+                            common_prefix = common_prefix[:-len(sfx_to_strip)]
+                            break 
+                    if common_prefix and not common_prefix.endswith('_'):
+                         final_name = common_prefix
+                    else: 
+                         final_name = f"sGIRF_{basenames[0][:8]}" 
+                else:
+                    final_name = f"sGIRF_{basenames[0][:8]}" if basenames else "sGIRF_from_files"
+            except Exception:
+                final_name = "sGIRF_from_files"
+        
+        return cls(
+            h_xx_t=h_arrays_loaded['xx'], h_xy_t=h_arrays_loaded['xy'], h_xz_t=h_arrays_loaded['xz'],
+            h_yx_t=h_arrays_loaded['yx'], h_yy_t=h_arrays_loaded['yy'], h_yz_t=h_arrays_loaded['yz'],
+            h_zx_t=h_arrays_loaded['zx'], h_zy_t=h_arrays_loaded['zy'], h_zz_t=h_arrays_loaded['zz'],
+            dt_sgirf=dt_sgirf, name=final_name
+        )
+
+
+
+class sGIRF:
+    """
+    Represents a spatially-dependent Gradient Impulse Response Function (sGIRF) matrix.
+    This class stores a 3x3 matrix of impulse responses, where h_ij(t) represents
+    the response on output axis i due to an input on command axis j.
+
+    Attributes:
+        h_t_matrix (np.ndarray): A 3x3 object array where each element (i,j) is a 
+                                 1D NumPy array representing h_ij(t).
+        dt_sgirf (float): Time resolution (dt) common to all impulse responses, in seconds.
+        name (Optional[str]): An optional name for the sGIRF profile.
+    """
+    def __init__(self, 
+                 h_xx_t: np.ndarray, h_xy_t: np.ndarray, h_xz_t: np.ndarray,
+                 h_yx_t: np.ndarray, h_yy_t: np.ndarray, h_yz_t: np.ndarray,
+                 h_zx_t: np.ndarray, h_zy_t: np.ndarray, h_zz_t: np.ndarray,
+                 dt_sgirf: float, name: Optional[str] = None):
+        """
+        Initializes the sGIRF object.
+
+        Args:
+            h_xx_t through h_zz_t: 1D NumPy arrays for each component of the 
+                                   sGIRF matrix (e.g., h_xy_t is response on X axis
+                                   due to Y command). All must be provided.
+            dt_sgirf (float): Time resolution of all GIRF data in seconds.
+            name (Optional[str], optional): Name for the sGIRF profile. 
+                                           Defaults to "Custom_sGIRF".
+        
+        Raises:
+            ValueError: If dt_sgirf is not positive, if any h_ij_t is not a 1D array,
+                        if h_ij_t arrays have different lengths, or if their length is 0.
+        """
+        if dt_sgirf <= 0:
+            raise ValueError("dt_sgirf must be positive.")
+        self.dt_sgirf = float(dt_sgirf)
+        self.name = name if name is not None else "Custom_sGIRF"
+
+        h_arrays = [
+            h_xx_t, h_xy_t, h_xz_t,
+            h_yx_t, h_yy_t, h_yz_t,
+            h_zx_t, h_zy_t, h_zz_t
+        ]
+        h_names = [
+            "h_xx_t", "h_xy_t", "h_xz_t",
+            "h_yx_t", "h_yy_t", "h_yz_t",
+            "h_zx_t", "h_zy_t", "h_zz_t"
+        ]
+
+        processed_h_arrays = []
+        first_len = -1
+
+        for i, h_array in enumerate(h_arrays):
+            if h_array is None: 
+                raise ValueError(f"Component {h_names[i]} must be provided.")
+            
+            arr = np.asarray(h_array)
+            if arr.ndim != 1:
+                raise ValueError(f"{h_names[i]} must be a 1D array, got ndim {arr.ndim}.")
+            if arr.size == 0:
+                raise ValueError(f"{h_names[i]} must not be an empty array (length 0).")
+
+            if i == 0:
+                first_len = arr.size
+            elif arr.size != first_len:
+                raise ValueError(f"All h_ij_t arrays must have the same length. "
+                                 f"{h_names[0]} has length {first_len}, but "
+                                 f"{h_names[i]} has length {arr.size}.")
+            processed_h_arrays.append(arr)
+        
+        self.h_t_matrix = np.empty((3,3), dtype=object)
+        self.h_t_matrix[0,0] = processed_h_arrays[0]
+        self.h_t_matrix[0,1] = processed_h_arrays[1]
+        self.h_t_matrix[0,2] = processed_h_arrays[2]
+        self.h_t_matrix[1,0] = processed_h_arrays[3]
+        self.h_t_matrix[1,1] = processed_h_arrays[4]
+        self.h_t_matrix[1,2] = processed_h_arrays[5]
+        self.h_t_matrix[2,0] = processed_h_arrays[6]
+        self.h_t_matrix[2,1] = processed_h_arrays[7]
+        self.h_t_matrix[2,2] = processed_h_arrays[8]
+        
+        self._response_len = first_len 
+
+    def __repr__(self) -> str:
+        name_str = f"'{self.name}'" if self.name else "None"
+        return (f"sGIRF(name={name_str}, dt_sgirf={self.dt_sgirf:.2e}, "
+                f"response_len={self._response_len}, shape=(3,3))")
+
+    @classmethod
+    def from_numpy_files(cls, filepaths: Dict[str, str], 
+                         dt_sgirf: float, name: Optional[str] = None) -> 'sGIRF':
+        """
+        Loads sGIRF data from .npy files for all 9 components.
+
+        Args:
+            filepaths (Dict[str, str]): Dictionary with keys 'xx', 'xy', 'xz',
+                                       'yx', 'yy', 'yz', 'zx', 'zy', 'zz'.
+                                       Values are filepaths to .npy files.
+            dt_sgirf (float): Time resolution of the GIRF data in seconds.
+            name (Optional[str], optional): Name for the sGIRF profile. 
+                                           If None, a default name is generated.
+        Returns:
+            sGIRF: An instance of the sGIRF class.
+        Raises:
+            ValueError: If not all 9 filepaths are provided, if dt_sgirf is not positive,
+                        or if files are not valid .npy or do not contain 1D arrays,
+                        or if loaded arrays have inconsistent lengths or zero length.
+            FileNotFoundError: If any specified .npy file does not exist.
+        """
+        required_keys = {'xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz'}
+        if not required_keys.issubset(filepaths.keys()):
+            missing_keys = required_keys - filepaths.keys()
+            raise ValueError(f"Missing required filepaths for sGIRF components: {missing_keys}")
+
+        h_arrays_loaded = {}
+        try:
+            for key_suffix in sorted(list(required_keys)): # Ensure consistent order for potential naming
+                path = filepaths[key_suffix]
+                arr = np.load(path)
+                if arr.ndim != 1: # Basic validation, more in __init__
+                    raise ValueError(f"Data in {path} (for {key_suffix}) is not 1D, shape: {arr.shape}")
+                h_arrays_loaded[key_suffix] = arr
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Could not load sGIRF data: {e.filename} not found.") from e
+        except Exception as e: 
+            raise ValueError(f"Error loading or validating sGIRF data from .npy files: {e}")
+
+        final_name = name
+        if final_name is None:
+            try:
+                basenames = [os.path.splitext(os.path.basename(filepaths[key]))[0] for key in sorted(filepaths.keys())]
+                common_prefix = os.path.commonprefix(basenames)
+                # Attempt to remove common axis suffixes like _xx, _xy etc. from the common_prefix
+                # This is heuristic and might need refinement based on common naming conventions.
+                if len(common_prefix) > 3:
+                    potential_suffixes_to_strip = ['_xx', '_xy', '_xz', '_yx', '_yy', '_yz', '_zx', '_zy', '_zz', 
+                                                   '-xx', '-xy', '-xz', '-yx', '-yy', '-yz', '-zx', '-zy', '-zz']
+                    for sfx_to_strip in potential_suffixes_to_strip:
+                        if common_prefix.lower().endswith(sfx_to_strip):
+                            common_prefix = common_prefix[:-len(sfx_to_strip)]
+                            break 
+                    # If after stripping, the prefix is still meaningful (e.g. not empty or just "_")
+                    if common_prefix and not common_prefix.endswith('_'):
+                         final_name = common_prefix
+                    else: # Fallback if stripping made it too short or awkward
+                         final_name = f"sGIRF_{basenames[0][:8]}" 
+                else:
+                    final_name = f"sGIRF_{basenames[0][:8]}" if basenames else "sGIRF_from_files"
+            except Exception:
+                final_name = "sGIRF_from_files"
+        
+        return cls(
+            h_xx_t=h_arrays_loaded['xx'], h_xy_t=h_arrays_loaded['xy'], h_xz_t=h_arrays_loaded['xz'],
+            h_yx_t=h_arrays_loaded['yx'], h_yy_t=h_arrays_loaded['yy'], h_yz_t=h_arrays_loaded['yz'],
+            h_zx_t=h_arrays_loaded['zx'], h_zy_t=h_arrays_loaded['zy'], h_zz_t=h_arrays_loaded['zz'],
+            dt_sgirf=dt_sgirf, name=final_name
+        )
+
+
+
 def precompensate_gradients_with_girf(target_trajectory: Trajectory, 
                                       girf: GIRF, 
                                       num_iterations: int = 10, 
@@ -2786,3 +3104,91 @@ def correct_kspace_with_girf(trajectory: Trajectory,
         metadata=new_metadata,
         gamma_Hz_per_T=gamma_val # Crucial: new trajectory's gamma is the one used for k-space calc
     )
+
+
+def generate_tw_ssi_pulse(duration_s: float, 
+                          bandwidth_hz: float, 
+                          dt_s: float = 4e-6, 
+                          tukey_alpha: float = 0.3) -> np.ndarray:
+    """
+    Generates a Tukey-windowed Shifted Sine-Integral (SSI) pulse waveform.
+
+    This pulse shape is based on the work by J. P. M. van der Zwaag et al., 
+    "Time-optimal design of slice-selective RF pulses: The FOCI algorithm," 
+    Magnetic Resonance in Medicine, 2010; 64:1748-1757. The SSI component provides
+    a sharp spectral profile, and the Tukey window tapers the pulse edges.
+
+    Args:
+        duration_s (float): Total duration of the pulse in seconds.
+        bandwidth_hz (float): Desired bandwidth of the pulse in Hz.
+        dt_s (float, optional): Time step (sampling interval) in seconds. 
+                                Defaults to 4e-6 s.
+        tukey_alpha (float, optional): Shape parameter for the Tukey window. 
+                                       Represents the ratio of taper duration to 
+                                       the total window duration. 0 means rectangular, 
+                                       1 means Hann window. Defaults to 0.3.
+
+    Returns:
+        np.ndarray: A 1D NumPy array representing the generated pulse waveform,
+                    normalized to have a peak absolute amplitude of 1.0.
+
+    Raises:
+        ValueError: If input parameters are invalid (e.g., non-positive duration,
+                    bandwidth, dt_s; tukey_alpha outside [0,1]; or duration too
+                    short for the given dt_s).
+        ImportError: If scipy is not installed (required for sici and tukey).
+    
+    Requires:
+        numpy, scipy.special.sici, scipy.signal.windows.tukey
+    """
+    # 1. Validate Inputs
+    if duration_s <= 0:
+        raise ValueError("Pulse duration_s must be positive.")
+    if bandwidth_hz <= 0:
+        raise ValueError("Pulse bandwidth_hz must be positive.")
+    if dt_s <= 0:
+        raise ValueError("Time step dt_s must be positive.")
+    if not (0 <= tukey_alpha <= 1):
+        raise ValueError("Tukey window alpha must be between 0 and 1 (inclusive).")
+
+    # 2. Determine Number of Points
+    num_points = int(round(duration_s / dt_s))
+    if num_points < 3: # Minimum points to define a shape (e.g., start, middle, end)
+        raise ValueError(f"Duration {duration_s}s is too short for dt_s {dt_s}s "
+                         f"to define a meaningful pulse shape (num_points={num_points} < 3).")
+
+    # 3. Create Time Vector
+    # Centered at t=0, from -duration_s/2 to +duration_s/2
+    t = np.linspace(-duration_s / 2, duration_s / 2, num_points, endpoint=True)
+
+    # 4. Calculate SSI Pulse g_ssi(t)
+    N_z = bandwidth_hz * duration_s  # Time-bandwidth product factor for SSI
+
+    # Arguments for Sine Integral function
+    # Note: 2t/tau ranges from -1 to 1.
+    # So, (2t/tau + 1) ranges from 0 to 2.
+    # And (1 - 2t/tau) ranges from 0 to 2 (in reverse order).
+    arg1 = np.pi * N_z * (2 * t / duration_s + 1)
+    arg2 = np.pi * N_z * (1 - 2 * t / duration_s)
+
+    # Calculate Sine Integrals
+    si_arg1, _ = sici(arg1) # sici returns (si, ci)
+    si_arg2, _ = sici(arg2)
+
+    g_ssi_unscaled = (1 / duration_s) * (si_arg1 + si_arg2 - np.pi)
+    
+    # Normalize the SSI component
+    max_abs_g_ssi = np.max(np.abs(g_ssi_unscaled))
+    if max_abs_g_ssi > 1e-9: # Avoid division by zero or by very small numbers
+        g_ssi_normalized = g_ssi_unscaled / max_abs_g_ssi
+    else: # Pulse is essentially zero everywhere
+        g_ssi_normalized = g_ssi_unscaled # Keep it as zeros
+
+    # 5. Generate Tukey Window
+    # M is the number of points in the window
+    tukey_win = tukey(num_points, alpha=tukey_alpha)
+
+    # 6. Apply Window
+    g_tw_ssi = g_ssi_normalized * tukey_win
+    
+    return g_tw_ssi

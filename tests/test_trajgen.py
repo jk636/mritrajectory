@@ -598,9 +598,12 @@ from trajgen import (
     reconstruct_image,
     display_trajectory,
     predict_actual_gradients, # Added import
-    correct_kspace_with_girf # Added import
+    correct_kspace_with_girf, # Added import
+    sGIRF # Added import for sGIRF
 )
 from unittest.mock import patch # For display_trajectory tests
+import tempfile # For temporary file/directory creation
+import shutil   # For removing directory tree
 
 
 class TestGenerateGoldenAngle3DTrajectory(unittest.TestCase):
@@ -2640,6 +2643,245 @@ class TestGenerateSpiralTrajectoryWithLimits(unittest.TestCase):
                 num_arms=1, num_samples_per_arm=10, fov_m=self.fov_m, dt_seconds=self.dt_seconds,
                 gamma_Hz_per_T=0, max_gradient_Tm_per_m=0.01, max_slew_rate_Tm_per_s=50.0
             )
+
+class TestSGIRF(unittest.TestCase):
+    def setUp(self):
+        self.dt_sgirf = 4e-6
+        self.response_len = 64
+        self.test_sgirf_name = "TestSGIRFProfile"
+
+        self.h_data_arrays = {}
+        self.base_data = np.arange(self.response_len, dtype=float) / self.response_len
+        
+        components = ['xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz']
+        for i, comp in enumerate(components):
+            # Create distinct data for each component
+            self.h_data_arrays[comp] = self.base_data + (i * 0.1) 
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.filepaths = {}
+        for comp, data in self.h_data_arrays.items():
+            filepath = os.path.join(self.temp_dir, f"sgirf_{comp}.npy")
+            np.save(filepath, data)
+            self.filepaths[comp] = filepath
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_sgirf_initialization_valid(self):
+        sgirf = sGIRF(
+            h_xx_t=self.h_data_arrays['xx'], h_xy_t=self.h_data_arrays['xy'], h_xz_t=self.h_data_arrays['xz'],
+            h_yx_t=self.h_data_arrays['yx'], h_yy_t=self.h_data_arrays['yy'], h_yz_t=self.h_data_arrays['yz'],
+            h_zx_t=self.h_data_arrays['zx'], h_zy_t=self.h_data_arrays['zy'], h_zz_t=self.h_data_arrays['zz'],
+            dt_sgirf=self.dt_sgirf, name=self.test_sgirf_name
+        )
+        self.assertEqual(sgirf.dt_sgirf, self.dt_sgirf)
+        self.assertEqual(sgirf.name, self.test_sgirf_name)
+        self.assertIsInstance(sgirf.h_t_matrix, np.ndarray)
+        self.assertEqual(sgirf.h_t_matrix.shape, (3,3))
+        self.assertEqual(sgirf.h_t_matrix.dtype, object)
+        self.assertEqual(sgirf._response_len, self.response_len)
+
+        np.testing.assert_array_equal(sgirf.h_t_matrix[0,0], self.h_data_arrays['xx'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[0,1], self.h_data_arrays['xy'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[0,2], self.h_data_arrays['xz'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[1,0], self.h_data_arrays['yx'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[1,1], self.h_data_arrays['yy'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[1,2], self.h_data_arrays['yz'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[2,0], self.h_data_arrays['zx'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[2,1], self.h_data_arrays['zy'])
+        np.testing.assert_array_equal(sgirf.h_t_matrix[2,2], self.h_data_arrays['zz'])
+
+    def test_sgirf_initialization_invalid_dt(self):
+        args = [self.h_data_arrays[comp] for comp in ['xx', 'xy', 'xz', 'yx', 'yy', 'yz', 'zx', 'zy', 'zz']]
+        with self.assertRaisesRegex(ValueError, "dt_sgirf must be positive"):
+            sGIRF(*args, dt_sgirf=0)
+        with self.assertRaisesRegex(ValueError, "dt_sgirf must be positive"):
+            sGIRF(*args, dt_sgirf=-1e-6)
+
+    def test_sgirf_initialization_invalid_h_dim(self):
+        h_2d = np.random.rand(self.response_len, 2)
+        valid_args = {key: arr.copy() for key, arr in self.h_data_arrays.items()}
+        
+        invalid_args = valid_args.copy()
+        invalid_args['xx'] = h_2d
+        with self.assertRaisesRegex(ValueError, "h_xx_t must be a 1D array"):
+            sGIRF(**invalid_args, dt_sgirf=self.dt_sgirf)
+
+    def test_sgirf_initialization_mismatched_lengths(self):
+        valid_args = {key: arr.copy() for key, arr in self.h_data_arrays.items()}
+        invalid_args = valid_args.copy()
+        invalid_args['xy'] = np.random.rand(self.response_len + 1) # Different length
+        
+        with self.assertRaisesRegex(ValueError, "All h_ij_t arrays must have the same length"):
+            sGIRF(**invalid_args, dt_sgirf=self.dt_sgirf)
+
+    def test_sgirf_initialization_zero_length_responses(self):
+        zero_len_args = {key: np.array([]) for key in self.h_data_arrays.keys()}
+        with self.assertRaisesRegex(ValueError, "must not be an empty array"):
+            sGIRF(**zero_len_args, dt_sgirf=self.dt_sgirf)
+
+    def test_sgirf_repr_method(self):
+        sgirf = sGIRF(**self.h_data_arrays, dt_sgirf=self.dt_sgirf, name=self.test_sgirf_name)
+        expected_repr = (f"sGIRF(name='{self.test_sgirf_name}', dt_sgirf={self.dt_sgirf:.2e}, "
+                         f"response_len={self.response_len}, shape=(3,3))")
+        self.assertEqual(repr(sgirf), expected_repr)
+
+    def test_from_numpy_files_successful_load(self):
+        sgirf = sGIRF.from_numpy_files(self.filepaths, self.dt_sgirf, name="LoadedSGIRF")
+        self.assertIsInstance(sgirf, sGIRF)
+        self.assertEqual(sgirf.name, "LoadedSGIRF")
+        self.assertEqual(sgirf.dt_sgirf, self.dt_sgirf)
+        self.assertEqual(sgirf._response_len, self.response_len)
+        for i, row_key in enumerate(['x', 'y', 'z']):
+            for j, col_key in enumerate(['x', 'y', 'z']):
+                np.testing.assert_array_equal(sgirf.h_t_matrix[i,j], self.h_data_arrays[row_key+col_key])
+        
+        # Test auto-name generation
+        sgirf_auto_name = sGIRF.from_numpy_files(self.filepaths, self.dt_sgirf)
+        # Default name is "sGIRF_sgirf" or similar, based on commonprefix logic
+        self.assertTrue(sgirf_auto_name.name.startswith("sGIRF_sgirf"))
+
+
+    def test_from_numpy_files_missing_key_in_dict(self):
+        incomplete_filepaths = self.filepaths.copy()
+        del incomplete_filepaths['xy']
+        with self.assertRaisesRegex(ValueError, "Missing required filepaths for sGIRF components: {'xy'}"):
+            sGIRF.from_numpy_files(incomplete_filepaths, self.dt_sgirf)
+
+    def test_from_numpy_files_file_not_found(self):
+        bad_filepaths = self.filepaths.copy()
+        bad_filepaths['xx'] = os.path.join(self.temp_dir, "non_existent_xx.npy")
+        with self.assertRaisesRegex(FileNotFoundError, "Could not load sGIRF data"):
+            sGIRF.from_numpy_files(bad_filepaths, self.dt_sgirf)
+
+    def test_from_numpy_files_invalid_npy_content(self):
+        # Test loading a file that contains a non-1D array
+        filepath_2d = os.path.join(self.temp_dir, "sgirf_xx_2d.npy")
+        np.save(filepath_2d, np.random.rand(self.response_len, 2)) # Save a 2D array
+        
+        bad_filepaths = self.filepaths.copy()
+        bad_filepaths['xx'] = filepath_2d
+        
+        with self.assertRaisesRegex(ValueError, "Data in .*sgirf_xx_2d.npy.*is not 1D"):
+            sGIRF.from_numpy_files(bad_filepaths, self.dt_sgirf)
+
+
+from trajgen import generate_tw_ssi_pulse # Import the new function
+
+class TestGenerateTwSsiPulse(unittest.TestCase):
+    def setUp(self):
+        self.default_duration_s = 1e-3  # 1 ms
+        self.default_bandwidth_hz = 4000  # 4 kHz
+        self.default_dt_s = 4e-6       # 4 us
+        self.default_tukey_alpha = 0.3
+
+    def test_generate_pulse_defaults(self):
+        pulse = generate_tw_ssi_pulse(
+            self.default_duration_s,
+            self.default_bandwidth_hz,
+            self.default_dt_s,
+            self.default_tukey_alpha
+        )
+        self.assertIsInstance(pulse, np.ndarray)
+        self.assertEqual(pulse.ndim, 1)
+        
+        expected_num_points = int(round(self.default_duration_s / self.default_dt_s))
+        self.assertEqual(pulse.shape[0], expected_num_points)
+        
+        # Check normalization (peak absolute value should be close to 1.0)
+        if expected_num_points > 0:
+            self.assertAlmostEqual(np.max(np.abs(pulse)), 1.0, places=6, 
+                                 msg="Pulse not normalized to peak abs value of 1.0")
+
+    def test_input_validation(self):
+        # Duration
+        with self.assertRaisesRegex(ValueError, "Pulse duration_s must be positive"):
+            generate_tw_ssi_pulse(0, self.default_bandwidth_hz)
+        with self.assertRaisesRegex(ValueError, "Pulse duration_s must be positive"):
+            generate_tw_ssi_pulse(-1e-3, self.default_bandwidth_hz)
+        # Bandwidth
+        with self.assertRaisesRegex(ValueError, "Pulse bandwidth_hz must be positive"):
+            generate_tw_ssi_pulse(self.default_duration_s, 0)
+        with self.assertRaisesRegex(ValueError, "Pulse bandwidth_hz must be positive"):
+            generate_tw_ssi_pulse(self.default_duration_s, -1000)
+        # dt_s
+        with self.assertRaisesRegex(ValueError, "Time step dt_s must be positive"):
+            generate_tw_ssi_pulse(self.default_duration_s, self.default_bandwidth_hz, dt_s=0)
+        with self.assertRaisesRegex(ValueError, "Time step dt_s must be positive"):
+            generate_tw_ssi_pulse(self.default_duration_s, self.default_bandwidth_hz, dt_s=-4e-6)
+        # tukey_alpha
+        with self.assertRaisesRegex(ValueError, "Tukey window alpha must be between 0 and 1"):
+            generate_tw_ssi_pulse(self.default_duration_s, self.default_bandwidth_hz, tukey_alpha=-0.1)
+        with self.assertRaisesRegex(ValueError, "Tukey window alpha must be between 0 and 1"):
+            generate_tw_ssi_pulse(self.default_duration_s, self.default_bandwidth_hz, tukey_alpha=1.1)
+        
+        # Duration too short for dt_s (num_points < 3)
+        with self.assertRaisesRegex(ValueError, "too short for dt_s .* to define a meaningful pulse shape"):
+            generate_tw_ssi_pulse(duration_s=1e-6, bandwidth_hz=1000, dt_s=1e-6) # num_points = 1
+        with self.assertRaisesRegex(ValueError, "too short for dt_s .* to define a meaningful pulse shape"):
+            generate_tw_ssi_pulse(duration_s=1.9e-6, bandwidth_hz=1000, dt_s=1e-6) # num_points = 2
+
+    def test_tukey_alpha_effects(self):
+        # alpha = 0 (rectangular window)
+        pulse_alpha0 = generate_tw_ssi_pulse(
+            self.default_duration_s, self.default_bandwidth_hz, tukey_alpha=0.0
+        )
+        # With alpha=0, the Tukey window is all ones. So, the pulse edges should not be zero
+        # unless the SSI part itself is zero there.
+        # The SSI component should generally not be zero at its very edges for typical params.
+        if pulse_alpha0.size > 0 :
+             self.assertTrue(np.abs(pulse_alpha0[0]) > 1e-3, "Pulse edge is zero with tukey_alpha=0 (start)")
+             self.assertTrue(np.abs(pulse_alpha0[-1]) > 1e-3, "Pulse edge is zero with tukey_alpha=0 (end)")
+
+        # alpha = 1 (Hann window)
+        pulse_alpha1 = generate_tw_ssi_pulse(
+            self.default_duration_s, self.default_bandwidth_hz, tukey_alpha=1.0
+        )
+        # With alpha=1, Tukey window is like a Hann window, so edges should be close to zero.
+        if pulse_alpha1.size > 0 :
+            self.assertAlmostEqual(pulse_alpha1[0], 0.0, places=6, msg="Pulse start not zero with tukey_alpha=1")
+            self.assertAlmostEqual(pulse_alpha1[-1], 0.0, places=6, msg="Pulse end not zero with tukey_alpha=1")
+
+        # alpha = 0.5 (default-like tapering)
+        pulse_alpha05 = generate_tw_ssi_pulse(
+            self.default_duration_s, self.default_bandwidth_hz, tukey_alpha=0.5
+        )
+        if pulse_alpha05.size > 0:
+            # Edges should be tapered, so non-zero but less than peak for alpha=0
+            self.assertTrue(np.abs(pulse_alpha05[0]) < np.abs(pulse_alpha0[0]) if pulse_alpha0.size > 0 else True)
+            self.assertTrue(np.abs(pulse_alpha05[-1]) < np.abs(pulse_alpha0[-1]) if pulse_alpha0.size > 0 else True)
+            # And edges should be non-zero (unlike alpha=1)
+            self.assertTrue(np.abs(pulse_alpha05[0]) > 1e-6 or pulse_alpha05.size < 10) # Allow if pulse is very short
+            self.assertTrue(np.abs(pulse_alpha05[-1]) > 1e-6 or pulse_alpha05.size < 10)
+
+
+    def test_zero_bandwidth_pulse_behavior(self):
+        # While bandwidth_hz > 0 is validated, if it were allowed to be zero,
+        # N_z would be 0. Si(0) = 0.
+        # g_ssi_unscaled = (1/tau) * [0 + 0 - pi] = -pi/tau
+        # This would then be normalized.
+        # This test is more conceptual as current validation prevents bandwidth_hz=0.
+        # If the SSI part becomes all zeros (e.g. if sici somehow returns pi/2 for both args),
+        # then g_ssi_unscaled would be 0.
+        # Let's test with a very small bandwidth that might lead to near-zero SSI.
+        # The function validates bandwidth_hz > 0.
+        # To test the "max_abs_g_ssi < 1e-9" branch, we'd need sici to produce nearly canceling terms.
+        # This is hard to force directly without mocking sici.
+        # For now, assume the normalization logic is covered by standard cases.
+        pass
+
+    def test_pulse_shape_properties(self):
+        # Check if the pulse is symmetric for typical parameters
+        pulse = generate_tw_ssi_pulse(
+            self.default_duration_s, self.default_bandwidth_hz, 
+            dt_s=self.default_dt_s, tukey_alpha=self.default_tukey_alpha
+        )
+        # The SSI component is symmetric. The Tukey window is symmetric.
+        # So, the product should be symmetric.
+        if pulse.size > 1:
+            np.testing.assert_allclose(pulse, pulse[::-1], atol=1e-6,
+                                       err_msg="Pulse shape is not symmetric for default parameters.")
 
 if __name__ == '__main__':
     unittest.main()
