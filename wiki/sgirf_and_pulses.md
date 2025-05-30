@@ -122,7 +122,7 @@ The function returns a 1D NumPy array representing the generated gradient wavefo
 
 ```python
 from trajgen import generate_tw_ssi_pulse
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt # For visualization
 
 pulse_duration = 2e-3  # 2 ms
 pulse_bandwidth = 5000 # 5 kHz
@@ -152,3 +152,19 @@ This function relies on functions from the `scipy` library:
 *   `scipy.signal.windows.tukey` for generating the Tukey window.
 
 Ensure `scipy` is installed in your Python environment to use this function.
+
+## 4. Using sGIRF in Trajectory Correction and Pre-compensation
+
+The `sGIRF` objects can be used with the trajectory correction and pre-compensation functions available in `trajgen.py` to account for cross-axis gradient imperfections. These functions now accept a `girf_system` parameter which can be either a `GIRF` or an `sGIRF` object.
+
+*   **`correct_kspace_with_girf(trajectory: Trajectory, girf_system: Union[GIRF, sGIRF], ...)`**:
+    *   When an `sGIRF` object is passed as `girf_system`, this function internally uses `predict_actual_gradients_from_sgirf` to determine the 3-axis actual gradient waveforms.
+    *   **Important Dimensionality Note**: If the input `trajectory` is 1D or 2D, the resulting corrected `Trajectory` object will have a **3-dimensional k-space and 3-dimensional actual gradient waveforms**. This is because the sGIRF model inherently predicts responses on all three physical axes (X, Y, Z). The initial k-space point for any newly introduced dimension (e.g., Z for a 2D input) is assumed to be zero.
+
+*   **`precompensate_gradients_with_girf(target_trajectory: Trajectory, girf_system: Union[GIRF, sGIRF], ...)`**:
+    *   When an `sGIRF` object is passed as `girf_system`, the iterative pre-compensation algorithm considers the full 3x3 sGIRF matrix for a global correction.
+    *   The internal iterative process updates a 3-component commanded gradient. The target gradients (from `target_trajectory`) are padded to 3D if necessary for error calculation against the 3D simulated actual gradients from the sGIRF.
+    *   The final `commanded_gradients_precompensated` stored in the output `Trajectory` object are **trimmed back to match the dimensionality of the original `target_trajectory`'s commanded gradients**. For instance, if a 2D target trajectory is supplied, the output pre-compensated trajectory will also feature 2D commanded gradients, despite the internal use of a 3x3 sGIRF model for calculations.
+
+Using `sGIRF` objects with these functions enables a more comprehensive correction by accounting for cross-axis gradient system imperfections.
+[end of wiki/sgirf_and_pulses.md]

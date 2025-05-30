@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, Union
 from scipy.spatial import Voronoi, ConvexHull, voronoi_plot_2d
 from scipy.spatial.qhull import QhullError
 from scipy.interpolate import griddata
@@ -2779,6 +2779,87 @@ class sGIRF:
         )
 
 
+def predict_actual_gradients_from_sgirf(trajectory: Trajectory, sgirf: sGIRF) -> np.ndarray:
+    """
+    Predicts the actual 3-axis gradient waveforms resulting from commanded gradients
+    passed through an sGIRF system model.
+
+    The sGIRF model includes both on-axis and cross-axis responses.
+    For example, the actual X gradient (Gx_act) is calculated as:
+    Gx_act = Gx_cmd * h_xx + Gy_cmd * h_xy + Gz_cmd * h_xz
+    where Gx_cmd, Gy_cmd, Gz_cmd are the commanded gradient waveforms, and
+    h_xx, h_xy, h_xz are the respective impulse responses from the sGIRF.
+    Similar calculations are done for Gy_act and Gz_act.
+
+    Args:
+        trajectory (Trajectory): The Trajectory object containing the commanded
+                                 k-space points and timing information. Its
+                                 `get_gradient_waveforms_Tm()` method should return
+                                 a (D, N) array, where D is the number of
+                                 commanded axes (1, 2, or 3) and N is the number of points.
+        sgirf (sGIRF): The sGIRF object containing the 3x3 matrix of impulse
+                       responses (h_ij) and their common time resolution (dt_sgirf).
+
+    Returns:
+        np.ndarray: A 2D NumPy array of shape (3, N) representing the predicted
+                    actual gradient waveforms for all three physical axes (X, Y, Z)
+                    in T/m. Returns an empty (3,0) array if commanded gradients
+                    cannot be obtained or are empty.
+    
+    Raises:
+        ValueError: If trajectory.dt_seconds is not available or not positive.
+    """
+    commanded_gradients = trajectory.get_gradient_waveforms_Tm()
+    dt_gradient = trajectory.dt_seconds
+
+    if dt_gradient is None or dt_gradient <= 0:
+        raise ValueError("trajectory.dt_seconds must be positive and available for sGIRF prediction.")
+
+    num_dims_traj = trajectory.get_num_dimensions()
+
+    if commanded_gradients is None or commanded_gradients.size == 0:
+        # Determine actual_num_dims for empty array shape
+        actual_num_dims_for_empty_return = 3 # sGIRF output is always 3D
+        return np.empty((actual_num_dims_for_empty_return, 0))
+
+    num_input_axes = commanded_gradients.shape[0]
+    num_points = commanded_gradients.shape[1]
+
+    if num_points == 0:
+        return np.empty((3, 0))
+
+    # sGIRF model always predicts 3 output axes (X, Y, Z)
+    num_output_axes = 3 
+    predicted_actual_gradients_all_axes = np.zeros((num_output_axes, num_points))
+
+    for i in range(num_output_axes):  # i is the output axis (0:X_act, 1:Y_act, 2:Z_act)
+        G_act_i_accumulator = np.zeros(num_points)
+        for j in range(num_input_axes):  # j is the input command axis (0:X_cmd, 1:Y_cmd, 2:Z_cmd)
+            G_cmd_j = commanded_gradients[j, :]
+            h_ij_t = sgirf.h_t_matrix[i, j] # h_ij(t)
+
+            term_ij = apply_girf_convolution(G_cmd_j, h_ij_t, dt_gradient, sgirf.dt_sgirf)
+            
+            if term_ij.size == num_points: # Ensure convolution result is valid and has correct length
+                G_act_i_accumulator += term_ij
+            elif term_ij.size == 0 and G_cmd_j.size == 0 : # If input was empty, term is empty, that's fine.
+                pass
+            elif term_ij.size == 0 and G_cmd_j.size > 0 and h_ij_t.size == 0: # Convolution with empty GIRF
+                 pass # Result is zero, so no accumulation needed
+            else: # Unexpected size mismatch
+                # This case should ideally be handled by apply_girf_convolution's robustness
+                # or indicate an issue with input sizes not caught earlier.
+                # For safety, one might log a warning or raise an error.
+                # Here, we'll assume apply_girf_convolution handles empty inputs appropriately
+                # and that non-empty inputs yield non-empty, correctly-sized outputs.
+                # If G_cmd_j is non-empty, term_ij should also be non-empty and same size.
+                pass
+
+
+        predicted_actual_gradients_all_axes[i, :] = G_act_i_accumulator
+        
+    return predicted_actual_gradients_all_axes
+
 
 def precompensate_gradients_with_girf(target_trajectory: Trajectory, 
                                       girf: GIRF, 
@@ -2958,21 +3039,27 @@ def precompensate_gradients_with_girf(target_trajectory: Trajectory,
         gamma_Hz_per_T=gamma_val
     )
 
-def correct_kspace_with_girf(trajectory: Trajectory, 
-                             girf: GIRF, 
+def correct_kspace_with_girf(trajectory: Trajectory,
+                             girf_system: Union[GIRF, sGIRF],
                              gamma_Hz_per_T: Optional[float] = None) -> Trajectory:
     """
     Corrects the k-space trajectory based on predicted actual gradient waveforms
-    obtained by convolving commanded gradients with a GIRF.
+    obtained by convolving commanded gradients with a GIRF or sGIRF.
+
+    If a GIRF is provided, it's assumed to model only on-axis effects.
+    If an sGIRF is provided, it models both on-axis and cross-axis effects,
+    and the predicted actual gradients will always be 3-dimensional (X,Y,Z).
+    Consequently, using an sGIRF on a 1D or 2D input trajectory will result
+    in a 3D corrected k-space trajectory.
 
     Args:
         trajectory (Trajectory): The original Trajectory object.
-        girf (GIRF): The GIRF object to use for correction.
+        girf_system (Union[GIRF, sGIRF]): The GIRF or sGIRF object to use for correction.
         gamma_Hz_per_T (Optional[float], optional): Gyromagnetic ratio in Hz/T.
             If None, it's taken from trajectory metadata or defaults to 1H value.
 
     Returns:
-        Trajectory: A new Trajectory object with the GIRF-corrected k-space points
+        Trajectory: A new Trajectory object with the corrected k-space points
                     and the predicted actual gradient waveforms. If correction cannot
                     be performed (e.g., missing dt or gradients), a copy of the
                     original trajectory is returned with metadata indicating failure.
@@ -2980,38 +3067,56 @@ def correct_kspace_with_girf(trajectory: Trajectory,
     Raises:
         ValueError: If trajectory.dt_seconds is not positive, or if the determined
                     gamma_Hz_per_T is not positive.
+        TypeError: If girf_system is not an instance of GIRF or sGIRF.
     """
     dt = trajectory.dt_seconds
     original_gamma = trajectory.metadata.get('gamma_Hz_per_T', COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'])
+    girf_type_str = "None"
+    girf_name_str = "None"
+    if isinstance(girf_system, GIRF):
+        girf_type_str = "GIRF"
+        girf_name_str = girf_system.name
+    elif isinstance(girf_system, sGIRF):
+        girf_type_str = "sGIRF"
+        girf_name_str = girf_system.name
+    else:
+        raise TypeError("girf_system must be an instance of GIRF or sGIRF.")
 
-    # Initial check for dt, as predict_actual_gradients also relies on it.
+    # Initial check for dt
     if dt is None or dt <= 0:
-        # Create a new metadata object for the returned "failed" trajectory
         fail_metadata = trajectory.metadata.copy()
         if 'girf_correction' not in fail_metadata: fail_metadata['girf_correction'] = {}
         fail_metadata['girf_correction'].update({
             'applied': False,
             'status': 'Trajectory dt_seconds is missing or non-positive.',
-            'girf_name': girf.name if girf else "None"
+            'type': girf_type_str,
+            'girf_name': girf_name_str
         })
         return Trajectory(
             name=trajectory.name + "_girf_correction_failed",
             kspace_points_rad_per_m=trajectory.kspace_points_rad_per_m,
             gradient_waveforms_Tm=trajectory.gradient_waveforms_Tm,
-            dt_seconds=trajectory.dt_seconds, # dt might be None here
+            dt_seconds=trajectory.dt_seconds,
             metadata=fail_metadata,
             gamma_Hz_per_T=original_gamma
         )
 
+    actual_gradients_Tm = None
     try:
-        actual_gradients_Tm = predict_actual_gradients(trajectory, girf)
+        if isinstance(girf_system, sGIRF):
+            actual_gradients_Tm = predict_actual_gradients_from_sgirf(trajectory, girf_system)
+        elif isinstance(girf_system, GIRF): # Explicitly check GIRF after sGIRF
+            actual_gradients_Tm = predict_actual_gradients(trajectory, girf_system)
+        # No else needed here due to the initial TypeError raise for invalid girf_system type
+            
     except ValueError as e: 
         new_metadata = trajectory.metadata.copy()
         if 'girf_correction' not in new_metadata: new_metadata['girf_correction'] = {}
         new_metadata['girf_correction'].update({
             'applied': False, 
             'status': f'Failed to predict actual gradients: {e}', 
-            'girf_name': girf.name if girf else "None"
+            'type': girf_type_str,
+            'girf_name': girf_name_str
         })
         return Trajectory(
             name=trajectory.name + "_girf_correction_failed",
@@ -3028,7 +3133,8 @@ def correct_kspace_with_girf(trajectory: Trajectory,
         new_metadata['girf_correction'].update({
             'applied': False, 
             'status': 'No actual gradients processed (input trajectory might be empty or lack valid dt).', 
-            'girf_name': girf.name if girf else "None"
+            'type': girf_type_str,
+            'girf_name': girf_name_str
         })
         return Trajectory(
             name=trajectory.name + "_girf_correction_failed",
@@ -3049,36 +3155,37 @@ def correct_kspace_with_girf(trajectory: Trajectory,
         else:
             raise ValueError("Provided gamma_Hz_per_T must be positive.")
     else:
-        gamma_val = original_gamma # Use gamma from original trajectory if not overridden
-        if gamma_val is None or gamma_val <= 0: # Fallback if original trajectory's gamma is invalid
+        gamma_val = original_gamma 
+        if gamma_val is None or gamma_val <= 0: 
             gamma_val = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
     
     if gamma_val <= 0: 
         raise ValueError("Determined gamma_Hz_per_T for correction must be positive.")
 
     # Calculate Corrected k-space Points
+    # actual_gradients_Tm will be (D_actual, N) or (3, N) if sGIRF was used.
+    # initial_k needs to match the number of output dimensions from actual_gradients_Tm.
+    num_output_dims_actual = actual_gradients_Tm.shape[0]
+    
     if trajectory.kspace_points_rad_per_m.size == 0 or actual_gradients_Tm.shape[1] == 0:
-        # If original k-space or gradients are empty (e.g. 0 points), corrected k-space is also empty
         k_corrected_points = np.empty_like(actual_gradients_Tm)
     else:
-        initial_k = trajectory.kspace_points_rad_per_m[:, 0].reshape(-1, 1) # Ensure (D,1)
-        
-        # deltas_k are the changes in k-space for each sample interval, based on the gradient *at that sample*
-        # k_new[t] = k_old[t-1] + G[t-1]*gamma*dt (if G is constant over interval dt before point t)
-        # OR k_new[t] = k_old[t-1] + (G[t-1]+G[t])/2 *gamma*dt (trapezoidal)
-        # Simplest: k_new[t] = k_old[t-1] + G_avg_over_interval * gamma * dt
-        # If actual_gradients_Tm[:,i] is G(t_i), then delta_k between t_i and t_{i+1} is G(t_i)*gamma*dt
-        # So, k_corr[0] = k_orig[0]
-        # k_corr[1] = k_orig[0] + actual_gradients_Tm[:,0]*gamma*dt
-        # k_corr[i] = k_orig[0] + sum_{j=0 to i-1} (actual_gradients_Tm[:,j]*gamma*dt)
-        
+        # Prepare initial_k. If original trajectory was <3D and sGIRF produced 3D actual grads,
+        # we need to decide how to initialize the k-space for the new dimensions.
+        # A common approach is to assume the initial k-space point for new dimensions is zero.
+        original_k0 = trajectory.kspace_points_rad_per_m[:, 0]
+        if original_k0.shape[0] < num_output_dims_actual:
+            initial_k_temp = np.zeros(num_output_dims_actual)
+            initial_k_temp[:original_k0.shape[0]] = original_k0
+            initial_k = initial_k_temp.reshape(-1,1)
+        else: # original_k0.shape[0] >= num_output_dims_actual (e.g. 3D traj with GIRF, or 3D traj with sGIRF)
+            initial_k = original_k0[:num_output_dims_actual].reshape(-1,1)
+
         deltas_k_per_sample = actual_gradients_Tm * gamma_val * dt
         
         k_corrected_points = np.zeros_like(actual_gradients_Tm)
-        k_corrected_points[:, 0] = initial_k.flatten() # initial_k is (D,1), flatten to (D,)
+        k_corrected_points[:, 0] = initial_k.flatten()
         if actual_gradients_Tm.shape[1] > 1:
-            # cumulative_deltas = sum_{j=0 to i-1} of deltas_k_per_sample[:,j]
-            # This is applied to k_corrected_points[:,i]
             cumulative_deltas = np.cumsum(deltas_k_per_sample[:, :-1], axis=1)
             k_corrected_points[:, 1:] = initial_k + cumulative_deltas
             
@@ -3088,21 +3195,22 @@ def correct_kspace_with_girf(trajectory: Trajectory,
     if 'girf_correction' not in new_metadata: new_metadata['girf_correction'] = {}
     new_metadata['girf_correction'].update({
         'applied': True,
-        'girf_name': girf.name if girf else "None",
+        'type': girf_type_str,
+        'girf_name': girf_name_str,
         'gamma_used_for_correction': gamma_val
     })
     if gamma_override_used:
         new_metadata['girf_correction']['gamma_override_Hz_per_T'] = gamma_Hz_per_T
     
-    new_metadata['gamma_Hz_per_T'] = gamma_val # Update the main gamma to the one used for correction
+    new_metadata['gamma_Hz_per_T'] = gamma_val
 
     return Trajectory(
         name=new_name,
         kspace_points_rad_per_m=k_corrected_points,
-        gradient_waveforms_Tm=actual_gradients_Tm, # Store the predicted actual gradients
+        gradient_waveforms_Tm=actual_gradients_Tm, 
         dt_seconds=dt,
         metadata=new_metadata,
-        gamma_Hz_per_T=gamma_val # Crucial: new trajectory's gamma is the one used for k-space calc
+        gamma_Hz_per_T=gamma_val 
     )
 
 
