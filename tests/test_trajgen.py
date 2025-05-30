@@ -596,7 +596,9 @@ from trajgen import (
     generate_golden_angle_3d_trajectory, # Added import
     constrain_trajectory,
     reconstruct_image,
-    display_trajectory
+    display_trajectory,
+    predict_actual_gradients, # Added import
+    correct_kspace_with_girf # Added import
 )
 from unittest.mock import patch # For display_trajectory tests
 
@@ -1463,6 +1465,51 @@ class TestGIRF(unittest.TestCase):
         np.save(self.filepath_y, self.sample_ht_y)
         np.save(self.filepath_z, self.sample_ht_z)
 
+        # Sample Trajectory for predict_actual_gradients tests
+        self.dt_traj = 1e-5
+        self.num_points_traj = 100
+        k_max_val = np.pi / 0.01 # Corresponds to 1cm FOV / 2
+        
+        # 3D Trajectory
+        kx_3d = np.linspace(0, k_max_val, self.num_points_traj)
+        ky_3d = np.linspace(0, k_max_val/2, self.num_points_traj) # Different ramp for Y
+        kz_3d = np.zeros(self.num_points_traj) # Zero gradient for Z
+        self.kspace_3d_for_girf_test = np.stack([kx_3d, ky_3d, kz_3d], axis=0) # Shape (3, N)
+        self.traj_3d_for_girf = Trajectory(
+            name="TestTraj3D_forGIRF",
+            kspace_points_rad_per_m=self.kspace_3d_for_girf_test,
+            dt_seconds=self.dt_traj
+        )
+
+        # 2D Trajectory
+        kx_2d = np.linspace(0, k_max_val, self.num_points_traj)
+        ky_2d = np.linspace(0, k_max_val/3, self.num_points_traj)
+        self.kspace_2d_for_girf_test = np.stack([kx_2d, ky_2d], axis=0) # Shape (2, N)
+        self.traj_2d_for_girf = Trajectory(
+            name="TestTraj2D_forGIRF",
+            kspace_points_rad_per_m=self.kspace_2d_for_girf_test,
+            dt_seconds=self.dt_traj
+        )
+        
+        # Identity GIRF (matches trajectory dt)
+        self.identity_girf = GIRF(
+            h_t_x=np.array([1.0]), 
+            h_t_y=np.array([1.0]), 
+            h_t_z=np.array([1.0]),
+            dt_girf=self.dt_traj, 
+            name="IdentityGIRF"
+        )
+        
+        # Scaling GIRF (matches trajectory dt)
+        self.scaling_girf = GIRF(
+            h_t_x=np.array([0.5]), 
+            h_t_y=np.array([2.0]), 
+            h_t_z=np.array([1.0]), # Z will be tested with zero commanded gradient
+            dt_girf=self.dt_traj,
+            name="ScalingGIRF"
+        )
+
+
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
 
@@ -1583,8 +1630,406 @@ class TestGIRF(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
             GIRF.from_files(self.filepath_x, self.filepath_y, self.filepath_z, dt_girf=0)
 
+    # Tests for correct_kspace_with_girf (added to TestGIRF class)
+    def test_correct_kspace_identity_girf(self):
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'), 
+                        "GIRF correction 'applied' flag not set or False for identity GIRF.")
+        self.assertEqual(girf_correction_meta.get('girf_name'), self.identity_girf.name)
+        
+        original_kspace = self.traj_3d_for_girf.kspace_points_rad_per_m
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            original_kspace, 
+            atol=1e-6, rtol=1e-5, 
+            err_msg="K-space changed significantly with identity GIRF and matching dt."
+        )
+        
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        np.testing.assert_allclose(
+            corrected_traj.gradient_waveforms_Tm, 
+            original_gradients, 
+            atol=1e-7, rtol=1e-6,
+            err_msg="Gradients changed with identity GIRF and matching dt."
+        )
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_corrected")
 
-from trajgen import apply_girf_convolution # Import the function to be tested
+    def test_correct_kspace_scaling_girf(self):
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.scaling_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction', {}).get('applied'))
+
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # The gradients stored in corrected_traj are the "actual_gradients_Tm" after GIRF convolution
+        predicted_actual_gradients = corrected_traj.gradient_waveforms_Tm 
+        
+        self.assertIsNotNone(original_gradients)
+        self.assertIsNotNone(predicted_actual_gradients)
+        
+        expected_scaled_gx = original_gradients[0, :] * self.scaling_girf.h_t_x[0] # Scale factor 0.5
+        expected_scaled_gy = original_gradients[1, :] * self.scaling_girf.h_t_y[0] # Scale factor 2.0
+        expected_scaled_gz = original_gradients[2, :] * self.scaling_girf.h_t_z[0] # Scale factor 1.0
+        
+        np.testing.assert_allclose(predicted_actual_gradients[0, :], expected_scaled_gx, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[1, :], expected_scaled_gy, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[2, :], expected_scaled_gz, atol=1e-7)
+
+        gamma = corrected_traj.metadata['girf_correction']['gamma_used_for_correction']
+        dt = corrected_traj.dt_seconds
+        
+        expected_k_corrected = np.zeros_like(predicted_actual_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+
+        if predicted_actual_gradients.shape[1] > 1:
+            deltas_k_per_sample = predicted_actual_gradients * gamma * dt
+            cumulative_deltas = np.cumsum(deltas_k_per_sample[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas # Add to initial_k_orig
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_gamma_override(self):
+        custom_gamma = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'] * 0.75 
+        
+        corrected_traj = correct_kspace_with_girf(
+            self.traj_3d_for_girf, 
+            self.identity_girf, # Identity GIRF means actual_gradients = commanded_gradients
+            gamma_Hz_per_T=custom_gamma
+        )
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'))
+        self.assertEqual(girf_correction_meta.get('gamma_used_for_correction'), custom_gamma)
+        self.assertEqual(girf_correction_meta.get('gamma_override_Hz_per_T'), custom_gamma)
+        self.assertEqual(corrected_traj.metadata['gamma_Hz_per_T'], custom_gamma) # Main metadata gamma
+
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # With identity GIRF, predicted_actual_gradients should be same as commanded
+        np.testing.assert_allclose(corrected_traj.gradient_waveforms_Tm, commanded_gradients, atol=1e-7)
+
+        # K-space should be different from original due to custom_gamma used in k-space integration
+        self.assertFalse(np.allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            self.traj_3d_for_girf.kspace_points_rad_per_m
+        ))
+
+        # Recalculate expected k-space with custom_gamma and original (commanded) gradients
+        expected_k_corrected = np.zeros_like(commanded_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+        if commanded_gradients.shape[1] > 1:
+            # Use commanded_gradients here as identity GIRF means actual_gradients = commanded_gradients
+            deltas_k_custom_gamma = commanded_gradients * custom_gamma * self.dt_traj 
+            cumulative_deltas_custom = np.cumsum(deltas_k_custom_gamma[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas_custom
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_trajectory_no_dt(self):
+        traj_no_dt = Trajectory("NoDt", self.kspace_3d_for_girf_test.copy(), dt_seconds=None)
+        
+        # This should now be caught by the initial check in correct_kspace_with_girf
+        corrected_traj = correct_kspace_with_girf(traj_no_dt, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("dt_seconds is missing or non-positive", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, traj_no_dt.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, traj_no_dt.kspace_points_rad_per_m)
+
+    @patch('trajgen.predict_actual_gradients')
+    def test_correct_kspace_empty_predicted_gradients(self, mock_predict_actual_gradients):
+        num_dims = self.traj_3d_for_girf.get_num_dimensions()
+        mock_predict_actual_gradients.return_value = np.empty((num_dims, 0))
+        
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("No actual gradients processed", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, 
+                                      self.traj_3d_for_girf.kspace_points_rad_per_m)
+        # The gradient_waveforms_Tm in the returned "failed" trajectory should be the empty ones
+        self.assertEqual(corrected_traj.gradient_waveforms_Tm.shape, (num_dims, 0))
+
+
+    def test_correct_kspace_start_point_preservation(self):
+        k_start_offset = np.array([10., -5., 100.]).reshape(-1,1) 
+        kspace_offset_start_data = self.traj_3d_for_girf.kspace_points_rad_per_m.copy()
+        # Create a new k-space where the first point is k_start_offset, and subsequent points maintain original relative positions
+        kspace_offset_start_data = kspace_offset_start_data - kspace_offset_start_data[:,0].reshape(-1,1) + k_start_offset
+
+        traj_offset = Trajectory(
+            name="OffsetStartTraj",
+            kspace_points_rad_per_m=kspace_offset_start_data,
+            dt_seconds=self.dt_traj
+        )
+        # Ensure the gamma from the original trajectory is used if no override
+        traj_offset.metadata['gamma_Hz_per_T'] = self.traj_3d_for_girf.metadata['gamma_Hz_per_T']
+
+        corrected_traj = correct_kspace_with_girf(traj_offset, self.identity_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction',{}).get('applied'))
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m[:, 0],
+            kspace_offset_start_data[:, 0],
+            atol=1e-7,
+            err_msg="Corrected k-space does not preserve the non-zero starting point."
+        )
+
+    # Tests for correct_kspace_with_girf
+    def test_correct_kspace_identity_girf(self):
+        # Assumes self.traj_3d_for_girf and self.identity_girf are set up with matching dt
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'), 
+                        "GIRF correction 'applied' flag not set or False for identity GIRF.")
+        self.assertEqual(girf_correction_meta.get('girf_name'), self.identity_girf.name)
+        
+        original_kspace = self.traj_3d_for_girf.kspace_points_rad_per_m
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            original_kspace, 
+            atol=1e-6, rtol=1e-5, 
+            err_msg="K-space changed significantly with identity GIRF and matching dt."
+        )
+        
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # The gradients stored in corrected_traj are the "actual_gradients_Tm" after GIRF convolution.
+        # For an identity GIRF, these should be the same as the original commanded gradients.
+        np.testing.assert_allclose(
+            corrected_traj.gradient_waveforms_Tm, 
+            original_gradients, 
+            atol=1e-7, rtol=1e-6,
+            err_msg="Gradients changed with identity GIRF and matching dt."
+        )
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_corrected")
+
+    def test_correct_kspace_scaling_girf(self):
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.scaling_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction', {}).get('applied'))
+
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # The gradients stored in corrected_traj are the "actual_gradients_Tm" after GIRF convolution
+        predicted_actual_gradients = corrected_traj.gradient_waveforms_Tm 
+        
+        self.assertIsNotNone(original_gradients)
+        self.assertIsNotNone(predicted_actual_gradients)
+        
+        expected_scaled_gx = original_gradients[0, :] * self.scaling_girf.h_t_x[0] # Scale factor 0.5
+        expected_scaled_gy = original_gradients[1, :] * self.scaling_girf.h_t_y[0] # Scale factor 2.0
+        expected_scaled_gz = original_gradients[2, :] * self.scaling_girf.h_t_z[0] # Scale factor 1.0
+        
+        np.testing.assert_allclose(predicted_actual_gradients[0, :], expected_scaled_gx, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[1, :], expected_scaled_gy, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[2, :], expected_scaled_gz, atol=1e-7)
+
+        gamma = corrected_traj.metadata['girf_correction']['gamma_used_for_correction']
+        dt = corrected_traj.dt_seconds
+        
+        expected_k_corrected = np.zeros_like(predicted_actual_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+
+        if predicted_actual_gradients.shape[1] > 1:
+            deltas_k_per_sample = predicted_actual_gradients * gamma * dt
+            cumulative_deltas = np.cumsum(deltas_k_per_sample[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas # Add to initial_k_orig
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_gamma_override(self):
+        custom_gamma = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'] * 0.75 
+        
+        corrected_traj = correct_kspace_with_girf(
+            self.traj_3d_for_girf, 
+            self.identity_girf, # Identity GIRF means actual_gradients = commanded_gradients
+            gamma_Hz_per_T=custom_gamma
+        )
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'))
+        self.assertEqual(girf_correction_meta.get('gamma_used_for_correction'), custom_gamma)
+        self.assertEqual(girf_correction_meta.get('gamma_override_Hz_per_T'), custom_gamma)
+        self.assertEqual(corrected_traj.metadata['gamma_Hz_per_T'], custom_gamma) # Main metadata gamma
+
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # With identity GIRF, predicted_actual_gradients should be same as commanded
+        np.testing.assert_allclose(corrected_traj.gradient_waveforms_Tm, commanded_gradients, atol=1e-7)
+
+        # K-space should be different from original due to custom_gamma used in k-space integration
+        self.assertFalse(np.allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            self.traj_3d_for_girf.kspace_points_rad_per_m
+        ))
+
+        # Recalculate expected k-space with custom_gamma and original (commanded) gradients
+        expected_k_corrected = np.zeros_like(commanded_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+        if commanded_gradients.shape[1] > 1:
+            # Use commanded_gradients here as identity GIRF means actual_gradients = commanded_gradients
+            deltas_k_custom_gamma = commanded_gradients * custom_gamma * self.dt_traj 
+            cumulative_deltas_custom = np.cumsum(deltas_k_custom_gamma[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas_custom
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_trajectory_no_dt(self):
+        traj_no_dt = Trajectory("NoDt", self.kspace_3d_for_girf_test.copy(), dt_seconds=None)
+        
+        # This should now be caught by the initial check in correct_kspace_with_girf
+        corrected_traj = correct_kspace_with_girf(traj_no_dt, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("dt_seconds is missing or non-positive", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, traj_no_dt.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, traj_no_dt.kspace_points_rad_per_m)
+
+    @patch('trajgen.predict_actual_gradients')
+    def test_correct_kspace_empty_predicted_gradients(self, mock_predict_actual_gradients):
+        num_dims = self.traj_3d_for_girf.get_num_dimensions()
+        mock_predict_actual_gradients.return_value = np.empty((num_dims, 0))
+        
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("No actual gradients processed", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, 
+                                      self.traj_3d_for_girf.kspace_points_rad_per_m)
+        # The gradient_waveforms_Tm in the returned "failed" trajectory should be the empty ones
+        self.assertEqual(corrected_traj.gradient_waveforms_Tm.shape, (num_dims, 0))
+
+
+    def test_correct_kspace_start_point_preservation(self):
+        k_start_offset = np.array([10., -5., 100.]).reshape(-1,1) 
+        kspace_offset_start_data = self.traj_3d_for_girf.kspace_points_rad_per_m.copy()
+        # Create a new k-space where the first point is k_start_offset, and subsequent points maintain original relative positions
+        kspace_offset_start_data = kspace_offset_start_data - kspace_offset_start_data[:,0].reshape(-1,1) + k_start_offset
+
+        traj_offset = Trajectory(
+            name="OffsetStartTraj",
+            kspace_points_rad_per_m=kspace_offset_start_data,
+            dt_seconds=self.dt_traj
+        )
+        # Ensure the gamma from the original trajectory is used if no override
+        traj_offset.metadata['gamma_Hz_per_T'] = self.traj_3d_for_girf.metadata['gamma_Hz_per_T']
+
+        corrected_traj = correct_kspace_with_girf(traj_offset, self.identity_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction',{}).get('applied'))
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m[:, 0],
+            kspace_offset_start_data[:, 0],
+            atol=1e-7,
+            err_msg="Corrected k-space does not preserve the non-zero starting point."
+        )
+
+    def test_predict_actual_gradients_identity_girf(self): # This was the start of the previous incorrect block
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        self.assertIsNotNone(commanded_gradients)
+
+        actual_gradients = predict_actual_gradients(self.traj_3d_for_girf, self.identity_girf)
+        
+        self.assertEqual(actual_gradients.shape, commanded_gradients.shape)
+        np.testing.assert_allclose(actual_gradients, commanded_gradients, atol=1e-7,
+                                   err_msg="Identity GIRF did not reproduce commanded gradients.")
+
+    def test_predict_actual_gradients_scaling_girf(self):
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        self.assertIsNotNone(commanded_gradients)
+
+        actual_gradients = predict_actual_gradients(self.traj_3d_for_girf, self.scaling_girf)
+        
+        self.assertEqual(actual_gradients.shape, commanded_gradients.shape)
+        np.testing.assert_allclose(actual_gradients[0, :], commanded_gradients[0, :] * 0.5, atol=1e-7,
+                                   err_msg="X-axis gradient not scaled correctly by 0.5")
+        np.testing.assert_allclose(actual_gradients[1, :], commanded_gradients[1, :] * 2.0, atol=1e-7,
+                                   err_msg="Y-axis gradient not scaled correctly by 2.0")
+        np.testing.assert_allclose(actual_gradients[2, :], commanded_gradients[2, :] * 1.0, atol=1e-7,
+                                   err_msg="Z-axis gradient not scaled correctly by 1.0 (zero grad case)")
+
+    def test_predict_actual_gradients_different_dt(self):
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        girf_different_dt = GIRF(
+            h_t_x=np.array([1.0]), h_t_y=np.array([1.0]), h_t_z=np.array([1.0]),
+            dt_girf=self.dt_traj * 0.5, # GIRF dt is faster
+            name="IdentityGIRF_Diff_dt_Upsample"
+        )
+        actual_gradients_upsample = predict_actual_gradients(self.traj_3d_for_girf, girf_different_dt)
+        self.assertEqual(actual_gradients_upsample.shape, commanded_gradients.shape)
+        # Sum preservation in apply_girf_convolution for identity GIRF should yield similar results
+        np.testing.assert_allclose(actual_gradients_upsample, commanded_gradients, rtol=1e-2, atol=1e-3, # Looser tolerance due to resampling
+                                   err_msg="Identity GIRF (upsampled) did not reproduce commanded gradients closely.")
+
+        girf_different_dt_downsample = GIRF(
+            h_t_x=np.array([1.0]), h_t_y=np.array([1.0]), h_t_z=np.array([1.0]),
+            dt_girf=self.dt_traj * 2.0, # GIRF dt is slower
+            name="IdentityGIRF_Diff_dt_Downsample"
+        )
+        actual_gradients_downsample = predict_actual_gradients(self.traj_3d_for_girf, girf_different_dt_downsample)
+        self.assertEqual(actual_gradients_downsample.shape, commanded_gradients.shape)
+        np.testing.assert_allclose(actual_gradients_downsample, commanded_gradients, rtol=1e-2, atol=1e-3,
+                                   err_msg="Identity GIRF (downsampled) did not reproduce commanded gradients closely.")
+
+    def test_predict_actual_gradients_2d_trajectory(self):
+        commanded_gradients_2d = self.traj_2d_for_girf.get_gradient_waveforms_Tm()
+        self.assertIsNotNone(commanded_gradients_2d)
+        self.assertEqual(commanded_gradients_2d.shape[0], 2) # Ensure it's 2D
+
+        # Using self.identity_girf which is 3-component but should only use X, Y
+        actual_gradients = predict_actual_gradients(self.traj_2d_for_girf, self.identity_girf)
+        
+        self.assertEqual(actual_gradients.shape, commanded_gradients_2d.shape)
+        self.assertEqual(actual_gradients.shape[0], 2)
+        np.testing.assert_allclose(actual_gradients, commanded_gradients_2d, atol=1e-7)
+
+    def test_predict_actual_gradients_empty_trajectory_kspace(self):
+        empty_kspace = np.empty((3, 0))
+        traj_empty = Trajectory(name="EmptyKSpaceTraj", kspace_points_rad_per_m=empty_kspace, dt_seconds=self.dt_traj)
+        
+        # get_gradient_waveforms_Tm for (D,0) kspace returns (D,0) array of zeros if D>0, N=0
+        # or if N=0, D=0, it returns empty array of shape (0,0) (or (0,) if 1D)
+        # predict_actual_gradients should return (D,0) or (0,0)
+        
+        actual_gradients = predict_actual_gradients(traj_empty, self.identity_girf)
+        self.assertEqual(actual_gradients.shape[0], 3) # Num dims from kspace shape
+        self.assertEqual(actual_gradients.shape[1], 0) # Num points is 0
+
+        empty_kspace_0D = np.empty((0,0))
+        traj_empty_0D = Trajectory(name="Empty0D", kspace_points_rad_per_m=empty_kspace_0D, dt_seconds=self.dt_traj)
+        actual_gradients_0D = predict_actual_gradients(traj_empty_0D, self.identity_girf)
+        self.assertEqual(actual_gradients_0D.shape, (0,0))
+
+
+    def test_predict_actual_gradients_no_dt_in_trajectory(self):
+        traj_no_dt = Trajectory(name="NoDtTraj", kspace_points_rad_per_m=self.kspace_3d_for_girf_test, dt_seconds=None)
+        # get_gradient_waveforms_Tm() returns None if dt is None.
+        # predict_actual_gradients raises ValueError if dt_gradient is None or <=0.
+        with self.assertRaisesRegex(ValueError, "trajectory.dt_seconds must be positive and available"):
+            predict_actual_gradients(traj_no_dt, self.identity_girf)
+
+        traj_zero_dt = Trajectory(name="ZeroDtTraj", kspace_points_rad_per_m=self.kspace_3d_for_girf_test, dt_seconds=0)
+        with self.assertRaisesRegex(ValueError, "trajectory.dt_seconds must be positive and available"):
+            predict_actual_gradients(traj_zero_dt, self.identity_girf)
 
 class TestApplyGirfConvolution(unittest.TestCase):
     def setUp(self):
