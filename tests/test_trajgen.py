@@ -1509,6 +1509,17 @@ class TestGIRF(unittest.TestCase):
             name="ScalingGIRF"
         )
 
+        # Blurring GIRF (matches trajectory dt, sums to 1)
+        blur_kernel_raw = np.array([0.25, 0.5, 0.25])
+        blur_kernel_normalized = blur_kernel_raw / np.sum(blur_kernel_raw)
+        self.blurring_girf = GIRF(
+            h_t_x=blur_kernel_normalized.copy(),
+            h_t_y=blur_kernel_normalized.copy(),
+            h_t_z=np.array([1.0]), # Keep Z simple for some tests, or use blur_kernel too
+            dt_girf=self.dt_traj,
+            name="BlurringGIRF"
+        )
+
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
@@ -1629,6 +1640,136 @@ class TestGIRF(unittest.TestCase):
     def test_from_files_invalid_dt(self):
         with self.assertRaisesRegex(ValueError, "dt_girf must be positive"):
             GIRF.from_files(self.filepath_x, self.filepath_y, self.filepath_z, dt_girf=0)
+
+    # Tests for precompensate_gradients_with_girf
+    def test_precompensate_identity_girf(self):
+        precomp_traj = precompensate_gradients_with_girf(
+            self.traj_3d_for_girf, self.identity_girf, num_iterations=5, alpha=0.5
+        )
+        precomp_meta = precomp_traj.metadata.get('girf_precompensation', {})
+        self.assertTrue(precomp_meta.get('applied'))
+        self.assertEqual(precomp_meta.get('girf_name'), self.identity_girf.name)
+        # For identity GIRF, errors should be very low quickly
+        for err in precomp_meta.get('final_relative_errors_per_axis', [1.0]): # Default to high error if not found
+            self.assertLess(err, 1e-3, "Error should be very small for identity GIRF precompensation.")
+
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        # Precompensated gradients should be very close to original for identity GIRF
+        np.testing.assert_allclose(
+            precomp_traj.gradient_waveforms_Tm, 
+            original_gradients, 
+            atol=1e-4, rtol=1e-3 # Iterative method might not be perfect
+        )
+        # Resulting k-space should also be very close
+        np.testing.assert_allclose(
+            precomp_traj.kspace_points_rad_per_m,
+            self.traj_3d_for_girf.kspace_points_rad_per_m,
+            atol=1e-4, rtol=1e-3
+        )
+        self.assertEqual(precomp_traj.name, self.traj_3d_for_girf.name + "_girf_precomp")
+
+
+    def test_precompensate_with_distorting_girf(self):
+        num_iter = 30 
+        alpha_val = 0.5 
+        target_traj = self.traj_3d_for_girf
+        
+        precomp_traj = precompensate_gradients_with_girf(
+            target_traj, self.blurring_girf, 
+            num_iterations=num_iter, alpha=alpha_val, tolerance=1e-3
+        )
+        precomp_meta = precomp_traj.metadata.get('girf_precompensation', {})
+        self.assertTrue(precomp_meta.get('applied'))
+        self.assertEqual(precomp_meta.get('num_iterations_run_per_axis'), num_iter)
+
+        precompensated_command_gradients = precomp_traj.gradient_waveforms_Tm
+        
+        cmd_traj_for_simulation = Trajectory(
+            name="sim_cmd",
+            kspace_points_rad_per_m=precomp_traj.kspace_points_rad_per_m, 
+            gradient_waveforms_Tm=precompensated_command_gradients,
+            dt_seconds=precomp_traj.dt_seconds,
+            metadata={'gamma_Hz_per_T': precomp_traj.metadata['gamma_Hz_per_T']}
+        )
+        simulated_actual_gradients = predict_actual_gradients(cmd_traj_for_simulation, self.blurring_girf)
+        
+        target_gradients = target_traj.get_gradient_waveforms_Tm()
+        np.testing.assert_allclose(simulated_actual_gradients, target_gradients, rtol=0.15, atol=0.005) 
+        
+        for i in range(target_gradients.shape[0]):
+            if np.linalg.norm(target_gradients[i,:]) > 1e-9: 
+                 girf_axis = [self.blurring_girf.h_t_x, self.blurring_girf.h_t_y, self.blurring_girf.h_t_z][i]
+                 if not np.allclose(girf_axis, [1.0]): 
+                     self.assertFalse(np.allclose(precompensated_command_gradients[i,:], target_gradients[i,:]), 
+                                     f"Axis {i} precompensated grad same as target despite distorting GIRF.")
+
+    def test_precompensate_convergence_tolerance(self):
+        target_traj = self.traj_3d_for_girf
+        
+        precomp_low_iter = precompensate_gradients_with_girf(
+            target_traj, self.blurring_girf, num_iterations=2, alpha=0.5, tolerance=1e-7 
+        )
+        errors_low_iter = precomp_low_iter.metadata['girf_precompensation']['final_relative_errors_per_axis']
+        
+        precomp_high_iter_met_tol = precompensate_gradients_with_girf(
+            target_traj, self.blurring_girf, num_iterations=50, alpha=0.5, tolerance=0.05 
+        )
+        errors_high_iter_met_tol = precomp_high_iter_met_tol.metadata['girf_precompensation']['final_relative_errors_per_axis']
+
+        for i in range(target_traj.get_num_dimensions()):
+            if np.linalg.norm(target_traj.get_gradient_waveforms_Tm()[i,:]) > 1e-9: 
+                self.assertTrue(errors_low_iter[i] > 1e-7 + 1e-9, 
+                                f"Axis {i}: Error {errors_low_iter[i]} met strict tolerance unexpectedly.")
+                self.assertLessEqual(errors_high_iter_met_tol[i], 0.05 + 1e-5, 
+                                     f"Axis {i}: Error {errors_high_iter_met_tol[i]} not below achievable tolerance.")
+                self.assertLess(errors_high_iter_met_tol[i], errors_low_iter[i],
+                                f"Axis {i}: Error did not decrease with more iterations.")
+
+
+    def test_precompensate_input_validation_and_failure_modes(self):
+        traj_no_dt = Trajectory("NoDt", self.kspace_3d_for_girf_test, dt_seconds=None)
+        failed_traj_no_dt = precompensate_gradients_with_girf(traj_no_dt, self.identity_girf)
+        self.assertFalse(failed_traj_no_dt.metadata['girf_precompensation']['applied'])
+        self.assertIn("dt_seconds is missing", failed_traj_no_dt.metadata['girf_precompensation']['status'])
+
+        empty_kspace = np.empty((self.traj_3d_for_girf.get_num_dimensions(), 0))
+        traj_empty_k = Trajectory("EmptyK", empty_kspace, dt_seconds=self.dt_traj)
+        failed_traj_empty_g = precompensate_gradients_with_girf(traj_empty_k, self.identity_girf)
+        self.assertFalse(failed_traj_empty_g.metadata['girf_precompensation']['applied'])
+        self.assertIn("no valid commanded gradients", failed_traj_empty_g.metadata['girf_precompensation']['status'])
+
+        with self.assertRaisesRegex(ValueError, "num_iterations must be positive"):
+            precompensate_gradients_with_girf(self.traj_3d_for_girf, self.identity_girf, num_iterations=0)
+        with self.assertRaisesRegex(ValueError, "alpha must be positive"):
+            precompensate_gradients_with_girf(self.traj_3d_for_girf, self.identity_girf, alpha=0)
+        with self.assertRaisesRegex(ValueError, "Provided gamma_Hz_per_T must be positive"):
+            precompensate_gradients_with_girf(self.traj_3d_for_girf, self.identity_girf, gamma_Hz_per_T=0)
+
+    def test_precompensate_kspace_recalculation_accuracy(self):
+        precomp_traj = precompensate_gradients_with_girf(
+            self.traj_3d_for_girf, self.blurring_girf, num_iterations=5
+        )
+        self.assertTrue(precomp_traj.metadata['girf_precompensation']['applied'])
+
+        precomp_gradients = precomp_traj.gradient_waveforms_Tm
+        dt = precomp_traj.dt_seconds
+        gamma = precomp_traj.metadata['girf_precompensation']['gamma_used_for_kspace_recalc']
+        num_dims_output = precomp_traj.get_num_dimensions()
+        
+        expected_k_recalc = np.zeros_like(precomp_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        
+        if precomp_gradients.shape[1] > 0 : 
+            expected_k_recalc = initial_k_orig + np.concatenate(
+                (np.zeros((num_dims_output,1)), np.cumsum(precomp_gradients[:, :-1] * gamma * dt, axis=1)), axis=1
+            )
+            
+        np.testing.assert_allclose(
+            precomp_traj.kspace_points_rad_per_m, 
+            expected_k_recalc, 
+            atol=1e-6, rtol=1e-5,
+            err_msg="Recalculated k-space in precompensated trajectory does not match manual calculation."
+        )
 
     # Tests for correct_kspace_with_girf (added to TestGIRF class)
     def test_correct_kspace_identity_girf(self):
@@ -2030,6 +2171,151 @@ class TestGIRF(unittest.TestCase):
         traj_zero_dt = Trajectory(name="ZeroDtTraj", kspace_points_rad_per_m=self.kspace_3d_for_girf_test, dt_seconds=0)
         with self.assertRaisesRegex(ValueError, "trajectory.dt_seconds must be positive and available"):
             predict_actual_gradients(traj_zero_dt, self.identity_girf)
+
+    # Tests for correct_kspace_with_girf (added to TestGIRF class)
+    def test_correct_kspace_identity_girf(self):
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'), 
+                        "GIRF correction 'applied' flag not set or False for identity GIRF.")
+        self.assertEqual(girf_correction_meta.get('girf_name'), self.identity_girf.name)
+        
+        original_kspace = self.traj_3d_for_girf.kspace_points_rad_per_m
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            original_kspace, 
+            atol=1e-6, rtol=1e-5, 
+            err_msg="K-space changed significantly with identity GIRF and matching dt."
+        )
+        
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        np.testing.assert_allclose(
+            corrected_traj.gradient_waveforms_Tm, 
+            original_gradients, 
+            atol=1e-7, rtol=1e-6,
+            err_msg="Gradients changed with identity GIRF and matching dt."
+        )
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_corrected")
+
+    def test_correct_kspace_scaling_girf(self):
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.scaling_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction', {}).get('applied'))
+
+        original_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        predicted_actual_gradients = corrected_traj.gradient_waveforms_Tm 
+        
+        self.assertIsNotNone(original_gradients)
+        self.assertIsNotNone(predicted_actual_gradients)
+        
+        expected_scaled_gx = original_gradients[0, :] * self.scaling_girf.h_t_x[0] 
+        expected_scaled_gy = original_gradients[1, :] * self.scaling_girf.h_t_y[0] 
+        expected_scaled_gz = original_gradients[2, :] * self.scaling_girf.h_t_z[0] 
+        
+        np.testing.assert_allclose(predicted_actual_gradients[0, :], expected_scaled_gx, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[1, :], expected_scaled_gy, atol=1e-7)
+        np.testing.assert_allclose(predicted_actual_gradients[2, :], expected_scaled_gz, atol=1e-7)
+
+        gamma = corrected_traj.metadata['girf_correction']['gamma_used_for_correction']
+        dt = corrected_traj.dt_seconds
+        
+        expected_k_corrected = np.zeros_like(predicted_actual_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+
+        if predicted_actual_gradients.shape[1] > 1:
+            deltas_k_per_sample = predicted_actual_gradients * gamma * dt
+            cumulative_deltas = np.cumsum(deltas_k_per_sample[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_gamma_override(self):
+        custom_gamma = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'] * 0.75 
+        
+        corrected_traj = correct_kspace_with_girf(
+            self.traj_3d_for_girf, 
+            self.identity_girf, 
+            gamma_Hz_per_T=custom_gamma
+        )
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertTrue(girf_correction_meta.get('applied'))
+        self.assertEqual(girf_correction_meta.get('gamma_used_for_correction'), custom_gamma)
+        self.assertEqual(girf_correction_meta.get('gamma_override_Hz_per_T'), custom_gamma)
+        self.assertEqual(corrected_traj.metadata['gamma_Hz_per_T'], custom_gamma)
+
+        commanded_gradients = self.traj_3d_for_girf.get_gradient_waveforms_Tm()
+        np.testing.assert_allclose(corrected_traj.gradient_waveforms_Tm, commanded_gradients, atol=1e-7)
+
+        self.assertFalse(np.allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            self.traj_3d_for_girf.kspace_points_rad_per_m
+        ))
+
+        expected_k_corrected = np.zeros_like(commanded_gradients)
+        initial_k_orig = self.traj_3d_for_girf.kspace_points_rad_per_m[:, 0].reshape(-1,1)
+        expected_k_corrected[:, 0] = initial_k_orig.flatten()
+        if commanded_gradients.shape[1] > 1:
+            deltas_k_custom_gamma = commanded_gradients * custom_gamma * self.dt_traj 
+            cumulative_deltas_custom = np.cumsum(deltas_k_custom_gamma[:, :-1], axis=1)
+            expected_k_corrected[:, 1:] = initial_k_orig + cumulative_deltas_custom
+        
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m, 
+            expected_k_corrected, 
+            atol=1e-6, rtol=1e-5
+        )
+
+    def test_correct_kspace_trajectory_no_dt(self):
+        traj_no_dt = Trajectory("NoDt", self.kspace_3d_for_girf_test.copy(), dt_seconds=None)
+        
+        corrected_traj = correct_kspace_with_girf(traj_no_dt, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("dt_seconds is missing or non-positive", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, traj_no_dt.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, traj_no_dt.kspace_points_rad_per_m)
+
+    @patch('trajgen.predict_actual_gradients')
+    def test_correct_kspace_empty_predicted_gradients(self, mock_predict_actual_gradients):
+        num_dims = self.traj_3d_for_girf.get_num_dimensions()
+        mock_predict_actual_gradients.return_value = np.empty((num_dims, 0))
+        
+        corrected_traj = correct_kspace_with_girf(self.traj_3d_for_girf, self.identity_girf)
+        
+        girf_correction_meta = corrected_traj.metadata.get('girf_correction', {})
+        self.assertFalse(girf_correction_meta.get('applied'))
+        self.assertIn("No actual gradients processed", girf_correction_meta.get('status', ''))
+        self.assertEqual(corrected_traj.name, self.traj_3d_for_girf.name + "_girf_correction_failed")
+        np.testing.assert_array_equal(corrected_traj.kspace_points_rad_per_m, 
+                                      self.traj_3d_for_girf.kspace_points_rad_per_m)
+        self.assertEqual(corrected_traj.gradient_waveforms_Tm.shape, (num_dims, 0))
+
+    def test_correct_kspace_start_point_preservation(self):
+        k_start_offset = np.array([10., -5., 100.]).reshape(-1,1) 
+        kspace_offset_start_data = self.traj_3d_for_girf.kspace_points_rad_per_m.copy()
+        kspace_offset_start_data = kspace_offset_start_data - kspace_offset_start_data[:,0].reshape(-1,1) + k_start_offset
+
+        traj_offset = Trajectory(
+            name="OffsetStartTraj",
+            kspace_points_rad_per_m=kspace_offset_start_data,
+            dt_seconds=self.dt_traj
+        )
+        traj_offset.metadata['gamma_Hz_per_T'] = self.traj_3d_for_girf.metadata['gamma_Hz_per_T']
+
+        corrected_traj = correct_kspace_with_girf(traj_offset, self.identity_girf)
+        self.assertTrue(corrected_traj.metadata.get('girf_correction',{}).get('applied'))
+        np.testing.assert_allclose(
+            corrected_traj.kspace_points_rad_per_m[:, 0],
+            kspace_offset_start_data[:, 0],
+            atol=1e-7,
+            err_msg="Corrected k-space does not preserve the non-zero starting point."
+        )
 
 class TestApplyGirfConvolution(unittest.TestCase):
     def setUp(self):

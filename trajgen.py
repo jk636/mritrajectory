@@ -2457,9 +2457,188 @@ def predict_actual_gradients(trajectory: Trajectory, girf: GIRF) -> np.ndarray:
     # If dim_commanded_grad was not empty, convolved_grad_axis should not be empty.
     
     # If the loop ran (num_dims_traj > 0), actual_gradient_axes should not be empty.
+    # If the loop ran (num_dims_traj > 0), actual_gradient_axes should not be empty.
     # All elements should be 1D arrays of the same length.
     return np.array(actual_gradient_axes)
 
+
+def precompensate_gradients_with_girf(target_trajectory: Trajectory, 
+                                      girf: GIRF, 
+                                      num_iterations: int = 10, 
+                                      alpha: float = 0.5, 
+                                      tolerance: Optional[float] = None, 
+                                      gamma_Hz_per_T: Optional[float] = None) -> Trajectory:
+    """
+    Iteratively pre-compensates gradient waveforms to achieve a target gradient output
+    when convolved with a Gradient Impulse Response Function (GIRF).
+
+    Args:
+        target_trajectory (Trajectory): Trajectory object whose commanded gradients
+                                        are the target for the pre-compensation.
+        girf (GIRF): The GIRF object characterizing the system response.
+        num_iterations (int, optional): Number of iterations for the pre-compensation
+                                        algorithm. Defaults to 10.
+        alpha (float, optional): Learning rate or step size for the iterative update.
+                                 Defaults to 0.5.
+        tolerance (Optional[float], optional): Relative error tolerance to stop iterations
+                                               early if achieved. Calculated as
+                                               norm(error) / norm(target_gradient).
+                                               If None, all iterations are performed.
+                                               Defaults to None.
+        gamma_Hz_per_T (Optional[float], optional): Gyromagnetic ratio in Hz/T to use
+                                                    for k-space recalculation. If None,
+                                                    it's taken from target_trajectory
+                                                    metadata or defaults to 1H value.
+
+    Returns:
+        Trajectory: A new Trajectory object with the pre-compensated k-space
+                    and gradient waveforms. If pre-compensation cannot be
+                    performed (e.g., missing dt or initial gradients), a copy
+                    of the original trajectory is returned with metadata
+                    indicating failure.
+    
+    Raises:
+        ValueError: If num_iterations or alpha are not positive, or if
+                    trajectory.dt_seconds or the determined gamma_Hz_per_T
+                    are not positive.
+    """
+    target_gradients_Tm = target_trajectory.get_gradient_waveforms_Tm()
+    dt_gradient = target_trajectory.dt_seconds
+    original_gamma = target_trajectory.metadata.get('gamma_Hz_per_T', COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'])
+
+    base_fail_metadata = target_trajectory.metadata.copy()
+    if 'girf_precompensation' not in base_fail_metadata: base_fail_metadata['girf_precompensation'] = {}
+
+    if dt_gradient is None or dt_gradient <= 0:
+        base_fail_metadata['girf_precompensation'].update({
+            'applied': False,
+            'status': 'Target trajectory dt_seconds is missing or non-positive.',
+            'girf_name': girf.name if girf else "None"
+        })
+        return Trajectory(name=target_trajectory.name + "_girf_precomp_failed",
+                          kspace_points_rad_per_m=target_trajectory.kspace_points_rad_per_m,
+                          gradient_waveforms_Tm=target_trajectory.gradient_waveforms_Tm,
+                          dt_seconds=target_trajectory.dt_seconds,
+                          metadata=base_fail_metadata,
+                          gamma_Hz_per_T=original_gamma)
+
+    if target_gradients_Tm is None or target_gradients_Tm.size == 0:
+        num_dims = target_trajectory.get_num_dimensions()
+        actual_num_dims = num_dims if num_dims > 0 else 0
+        base_fail_metadata['girf_precompensation'].update({
+            'applied': False,
+            'status': 'Target trajectory has no valid commanded gradients to precompensate.',
+            'girf_name': girf.name if girf else "None"
+        })
+        return Trajectory(name=target_trajectory.name + "_girf_precomp_failed",
+                          kspace_points_rad_per_m=target_trajectory.kspace_points_rad_per_m,
+                          gradient_waveforms_Tm=np.empty((actual_num_dims, 0)),
+                          dt_seconds=dt_gradient,
+                          metadata=base_fail_metadata,
+                          gamma_Hz_per_T=original_gamma)
+
+    if num_iterations <= 0:
+        raise ValueError("num_iterations must be positive.")
+    if alpha <= 0:
+        raise ValueError("alpha must be positive.")
+
+    commanded_gradients_precompensated = target_gradients_Tm.copy()
+    num_dims = target_gradients_Tm.shape[0]
+    final_errors_per_axis = [0.0] * num_dims
+
+    for axis_idx in range(num_dims):
+        G_target_axis = target_gradients_Tm[axis_idx, :]
+        G_cmd_axis_k = commanded_gradients_precompensated[axis_idx, :].copy() # Work on a copy per axis
+        
+        girf_h_t_axis: Optional[np.ndarray] = None
+        if axis_idx == 0: girf_h_t_axis = girf.h_t_x
+        elif axis_idx == 1: girf_h_t_axis = girf.h_t_y
+        elif axis_idx == 2: girf_h_t_axis = girf.h_t_z
+        else: raise ValueError(f"Unsupported axis index: {axis_idx}")
+
+        if girf_h_t_axis is None: # Should be caught by GIRF validation, but defensive check
+            raise ValueError(f"GIRF data for axis {axis_idx} is missing.")
+
+        norm_target = np.linalg.norm(G_target_axis)
+        if np.isclose(norm_target, 0.0): # If target gradient is zero, no precompensation needed/possible
+            final_errors_per_axis[axis_idx] = 0.0
+            commanded_gradients_precompensated[axis_idx, :] = G_target_axis # Should be all zeros
+            continue
+
+        for k_iter in range(num_iterations):
+            simulated_gradient_axis_k = apply_girf_convolution(
+                G_cmd_axis_k, girf_h_t_axis, dt_gradient, girf.dt_girf
+            )
+            error_gradient_axis_k = G_target_axis - simulated_gradient_axis_k
+            
+            norm_error = np.linalg.norm(error_gradient_axis_k)
+            relative_error = norm_error / norm_target # norm_target is >0 here
+            final_errors_per_axis[axis_idx] = relative_error
+
+            if tolerance is not None and relative_error < tolerance:
+                break 
+            
+            G_cmd_axis_k += alpha * error_gradient_axis_k
+        
+        commanded_gradients_precompensated[axis_idx, :] = G_cmd_axis_k
+
+    # Recalculate K-space from Pre-compensated Gradients
+    gamma_val = None
+    gamma_override_used = False
+    if gamma_Hz_per_T is not None:
+        if gamma_Hz_per_T > 0:
+            gamma_val = gamma_Hz_per_T
+            gamma_override_used = True
+        else:
+            raise ValueError("Provided gamma_Hz_per_T must be positive.")
+    else:
+        gamma_val = original_gamma
+        if gamma_val is None or gamma_val <= 0:
+            gamma_val = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+    if gamma_val <= 0:
+        raise ValueError("Determined gamma_Hz_per_T for k-space recalculation must be positive.")
+
+    k_space_precompensated = np.empty_like(commanded_gradients_precompensated)
+    if target_trajectory.kspace_points_rad_per_m.size > 0 and commanded_gradients_precompensated.shape[1] > 0 :
+        initial_k = target_trajectory.kspace_points_rad_per_m[:, 0].reshape(-1, 1)
+        deltas_k_precomp = commanded_gradients_precompensated * gamma_val * dt_gradient
+        
+        # k_space_precompensated[:,0] = initial_k
+        # k_space_precompensated[:,1:] = initial_k + cumsum(deltas_k_precomp[:,:-1])
+        k_space_precompensated = initial_k + np.concatenate(
+            (np.zeros((num_dims,1)), np.cumsum(deltas_k_precomp[:, :-1], axis=1)), axis=1
+        )
+    elif commanded_gradients_precompensated.shape[1] == 0: # No points
+        k_space_precompensated = np.empty((num_dims,0))
+    else: # Original k-space was empty, but somehow gradients were not (should not happen)
+         k_space_precompensated = np.cumsum(commanded_gradients_precompensated * gamma_val * dt_gradient, axis=1)
+
+
+    new_name = target_trajectory.name + "_girf_precomp"
+    new_metadata = target_trajectory.metadata.copy()
+    if 'girf_precompensation' not in new_metadata: new_metadata['girf_precompensation'] = {}
+    new_metadata['girf_precompensation'].update({
+        'applied': True,
+        'girf_name': girf.name if girf else "None",
+        'num_iterations_run_per_axis': num_iterations, # Could be refined if early exit is per axis
+        'alpha': alpha,
+        'tolerance_input': tolerance,
+        'final_relative_errors_per_axis': final_errors_per_axis,
+        'gamma_used_for_kspace_recalc': gamma_val
+    })
+    if gamma_override_used:
+        new_metadata['girf_precompensation']['gamma_override_param_Hz_per_T'] = gamma_Hz_per_T
+    
+    new_metadata['gamma_Hz_per_T'] = gamma_val
+
+    return Trajectory(
+        name=new_name,
+        kspace_points_rad_per_m=k_space_precompensated,
+        gradient_waveforms_Tm=commanded_gradients_precompensated,
+        dt_seconds=dt_gradient,
+        metadata=new_metadata,
+        gamma_Hz_per_T=gamma_val
+    )
 
 def correct_kspace_with_girf(trajectory: Trajectory, 
                              girf: GIRF, 
