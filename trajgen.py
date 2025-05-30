@@ -1519,38 +1519,29 @@ def generate_spiral_trajectory(num_arms: int,
                                max_k_rad_per_m: Optional[float] = None, 
                                num_revolutions: Optional[float] = None,
                                name: str = "spiral",
-                               dt_seconds: float = 4e-6) -> Trajectory:
+                               dt_seconds: float = 4e-6,
+                               max_gradient_Tm_per_m: Optional[float] = None,
+                               max_slew_rate_Tm_per_s: Optional[float] = None,
+                               gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']) -> Trajectory:
     """
-    Generates a 2D spiral k-space trajectory.
+    Generates a 2D spiral k-space trajectory, optionally with gradient and slew rate constraints.
 
     Args:
         num_arms (int): Number of spiral interleaves.
         num_samples_per_arm (int): Number of k-space samples per interleaf.
         fov_m (float): Field of view in meters. Used if max_k_rad_per_m is not given.
-        max_k_rad_per_m (Optional[float], optional): Maximum k-space radius in rad/m. 
+        max_k_rad_per_m (Optional[float], optional): Maximum k-space radius in rad/m.
                                                      If None, defaults to np.pi / fov_m.
         num_revolutions (Optional[float], optional): Number of revolutions for each spiral arm.
-                                                     If None, defaults to k_max / (pi / (fov_m / (num_arms * 0.5)))
-                                                     which is a heuristic for coverage. A higher value means tighter spiral.
-                                                     Or, more simply, relate to num_arms, e.g. 10-20.
-                                                     Let's try a simpler default like num_arms, or a fixed sensible value like 10.
-                                                     Let's use a default of `num_arms` if not specified, as per one of the suggestions.
-                                                     A common choice is also related to kmax and desired resolution.
-                                                     Let's refine to: default to `max_k_rad_per_m / (np.pi / (fov_m / num_arms)) / 2.0`
-                                                     This is roughly `k_max / (k_space_dist_between_arms_at_edge / 2)`.
-                                                     A simpler default: Let num_revolutions be related to num_arms, e.g., 5 * num_arms / (2*np.pi)
-                                                     Or just make it a fixed number if not specified, e.g. 10.
-                                                     Let's use a simpler default for now: num_revolutions = num_arms if not specified.
-                                                     A common reference (e.g. Pipe et al.) uses alpha in k = A * t * exp(i*alpha*t).
-                                                     Let's use the angle formulation: angle_offset + revolutions * 2 * pi * t_sample
-                                                     Defaulting num_revolutions to num_arms might be too dense for many arms.
-                                                     Let's try a default like 10, or make it dependent on other params.
-                                                     A sensible default for num_revolutions could be k_max / (delta_k_Nyquist_step).
-                                                     delta_k_Nyquist_step = 1/fov_m.
-                                                     So, num_revolutions = k_max * fov_m.
-                                                     If num_revolutions is None, let's try: num_revolutions = max_k_rad_per_m * fov_m / (2 * np.pi)
+                                                     Defaults to a heuristic (e.g., 10.0).
         name (str, optional): Name for the trajectory. Defaults to "spiral".
-        dt_seconds (float, optional): Dwell time for the trajectory. Defaults to 4e-6.
+        dt_seconds (float, optional): Dwell time for the trajectory. Defaults to 4e-6 s.
+        max_gradient_Tm_per_m (Optional[float], optional): Maximum gradient strength (T/m).
+                                                           If None or non-positive, not applied.
+        max_slew_rate_Tm_per_s (Optional[float], optional): Maximum slew rate (T/m/s).
+                                                             If None or non-positive, not applied.
+        gamma_Hz_per_T (float, optional): Gyromagnetic ratio in Hz/T.
+                                          Defaults to value for 1H.
 
     Returns:
         Trajectory: The generated spiral trajectory.
@@ -1562,69 +1553,95 @@ def generate_spiral_trajectory(num_arms: int,
         k_max = max_k_rad_per_m
 
     if num_revolutions is None:
-        # Heuristic: aim for arms to be somewhat spaced out at k_max
-        # Width of k-space covered by one arm revolution group: num_arms * (1/fov_m) approx.
-        # So, num_revolutions to fill k_max: k_max / (1/fov_m) = k_max * fov_m
-        # Each revolution is 2*pi radians.
-        num_revs = k_max * fov_m / (2 * np.pi) # Revolutions to reach k_max with steps of Nyquist
-        # This num_revs is for a single arm to cover the FOV.
-        # The term `巻き数` (num_revolutions) in the prompt is per arm.
-        # Let's use a fixed default if not provided, e.g., 10, or relate to coverage.
-        # A common way: num_revolutions = k_max * fov_m / (2 * np.pi * sqrt_num_arms_factor)
-        # For simplicity, let's use a default that might be reasonable for typical parameters.
-        # num_revolutions = k_max / (num_arms * (1/fov_m)) # Number of turns for each arm to fill its angular sector
-        num_revolutions = k_max * fov_m / (2 * np.pi * 0.5) # Aim for arms to be roughly Nyquist spaced at edge
-        # This might still be too large. Let's try a simpler default:
-        # Based on the prompt `angle = angle_offset + 2 * PI * t * num_arms` used in example, this implies num_arms revolutions.
-        # Let's use that interpretation for `num_revolutions` if not specified, i.e. each arm does `num_arms` turns.
-        # This can be very dense. Let's try a more common fixed value or simpler heuristic.
-        # Heuristic: number of samples / (some factor, e.g. 100)
-        # num_revolutions = num_samples_per_arm / 100.0 # Example
-        # Let's adopt the formula from the prompt's discussion:
-        # angle = angle_offset + revolutions * 2 * np.pi * t_sample
-        # Where `revolutions` is the variable we are setting.
-        # Let's make the default `num_revolutions` such that the spiral arms are roughly
-        # separated by `1/fov_m` at `k_max`.
-        # Circumference at k_max = 2 * pi * k_max.
-        # Space per arm = (2 * pi * k_max) / num_arms.
-        # We want this space to be roughly `N_rev * (1/fov_m)`.
-        # No, that's not right. The angular increment determines turns.
-        # Let's use a simpler default from common spirals: num_revolutions = k_max * sqrt(num_samples_per_arm) / (2*pi) (from Berstein Handbook)
-        # This is complex. Let's use the prompt's `angle = angle_offset + 2 * PI * t * num_arms` as a guide for the total angular sweep.
-        # If `num_revolutions` refers to the `巻き数` in the prompt, then it's the factor for `2 * pi * t_sample`.
-        # The prompt's example `angle = angle_offset + 2 * PI * t * num_arms` means "巻き数" = `num_arms`.
-        # Let's use this interpretation: if `num_revolutions` is not given, it implies this "num_arms" factor for turns.
-        # So, if `num_revolutions` parameter is given, it overrides this.
-        # Let's make default revolutions a fixed number like 10 for now if not set.
-        effective_revolutions = num_revolutions if num_revolutions is not None else 10.0
+        effective_revolutions = 10.0 # Default number of revolutions
+    else:
+        effective_revolutions = num_revolutions
+    
+    apply_limits = False
+    if max_gradient_Tm_per_m is not None and max_slew_rate_Tm_per_s is not None and \
+       max_gradient_Tm_per_m > 0 and max_slew_rate_Tm_per_s > 0:
+        apply_limits = True
+        if dt_seconds <= 0: # dt_seconds must be positive for limit calculations
+             raise ValueError("dt_seconds must be positive when applying gradient/slew limits.")
+        if gamma_Hz_per_T <= 0:
+            raise ValueError("gamma_Hz_per_T must be positive when applying gradient/slew limits.")
 
-
-    all_k_points_complex = []
+    all_k_points_list = []
 
     for j in range(num_arms):
         angle_offset = j * (2 * np.pi / num_arms)
-        arm_k_points_complex = []
+        arm_k_points = []
+        
+        current_k = np.array([0.0, 0.0])
+        current_G = np.array([0.0, 0.0])
+
         for s in range(num_samples_per_arm):
-            if num_samples_per_arm == 1:
-                t_sample = 1.0 # Avoid division by zero, place point at k_max
+            if s == 0:
+                k_next = np.array([0.0, 0.0])
+                G_final = np.array([0.0, 0.0])
             else:
-                t_sample = s / (num_samples_per_arm - 1) # Normalized time [0, 1]
-            
-            current_radius = t_sample * k_max
-            # Using the formula: current_angle = angle_offset + revolutions * 2 * np.pi * t_sample
-            current_angle = angle_offset + effective_revolutions * 2 * np.pi * t_sample
-            
-            kx = current_radius * np.cos(current_angle)
-            ky = current_radius * np.sin(current_angle)
-            arm_k_points_complex.append(kx + 1j * ky)
-        all_k_points_complex.extend(arm_k_points_complex)
+                # Calculate ideal k-space target for this sample s
+                # t_sample_ideal maps s from [1, num_samples_per_arm-1] to approx (0, 1]
+                # Or, more directly, s from [0, N-1] maps to [0,1] for radius scaling.
+                # For sample s (0-indexed), its radial position should be proportional to s.
+                if num_samples_per_arm == 1: # This case handled by s=0
+                    t_sample_ideal = 1.0 
+                else:
+                    # t_sample_ideal for radius should go from 0 to 1 over the arm.
+                    # Since s=0 is fixed at k=0, for s>0, we are calculating points 1 to N-1.
+                    # The ideal radius for sample `s` (1-indexed in terms of progression along arm)
+                    # should be `(s / (num_samples_per_arm -1)) * k_max`.
+                    # Here `s` is 0-indexed sample number.
+                    t_sample_ideal = s / (num_samples_per_arm - 1)
 
-    k_points_complex_array = np.array(all_k_points_complex) # Shape: (num_arms * num_samples_per_arm,)
 
-    # Convert to (2, N) real array
-    kx_all = k_points_complex_array.real
-    ky_all = k_points_complex_array.imag
-    k_space_points_rad_m = np.vstack((kx_all, ky_all)) # Shape: (2, num_arms * num_samples_per_arm)
+                ideal_radius = t_sample_ideal * k_max
+                ideal_angle = angle_offset + effective_revolutions * 2 * np.pi * t_sample_ideal
+                
+                k_ideal_target_for_sample_s = np.array([
+                    ideal_radius * np.cos(ideal_angle),
+                    ideal_radius * np.sin(ideal_angle)
+                ])
+
+                if apply_limits:
+                    dk_ideal = k_ideal_target_for_sample_s - current_k
+                    G_target = dk_ideal / (gamma_Hz_per_T * dt_seconds)
+                    
+                    norm_G_target = np.linalg.norm(G_target)
+                    if norm_G_target > max_gradient_Tm_per_m:
+                        G_limited = G_target * (max_gradient_Tm_per_m / norm_G_target)
+                    else:
+                        G_limited = G_target
+                    
+                    slew_required = (G_limited - current_G) / dt_seconds
+                    norm_slew_required = np.linalg.norm(slew_required)
+                    
+                    if norm_slew_required > max_slew_rate_Tm_per_s:
+                        dG_allowed_vector = (slew_required / norm_slew_required) * max_slew_rate_Tm_per_s * dt_seconds
+                        G_final = current_G + dG_allowed_vector
+                    else:
+                        G_final = G_limited
+                    
+                    dk_actual = G_final * gamma_Hz_per_T * dt_seconds
+                    k_next = current_k + dk_actual
+                else:
+                    k_next = k_ideal_target_for_sample_s
+                    if dt_seconds > 0 and gamma_Hz_per_T > 0:
+                        G_final = (k_next - current_k) / (gamma_Hz_per_T * dt_seconds)
+                    else: # Should not happen if apply_limits is false, but as a safeguard
+                        G_final = np.array([0.0, 0.0]) 
+
+            arm_k_points.append(k_next.copy())
+            current_k = k_next.copy()
+            current_G = G_final.copy()
+            
+        all_k_points_list.extend(arm_k_points)
+
+    if not all_k_points_list: # Handles num_arms=0 or num_samples_per_arm=0
+        k_space_points_rad_m = np.empty((2, 0))
+    else:
+        # Convert list of 2-element arrays to (total_num_points, 2) then transpose
+        k_space_points_rad_m = np.array(all_k_points_list).T
 
     metadata = {
         'generator_params': {
@@ -1632,16 +1649,20 @@ def generate_spiral_trajectory(num_arms: int,
             'num_arms': num_arms,
             'num_samples_per_arm': num_samples_per_arm,
             'fov_m': fov_m,
-            'max_k_rad_per_m_input': max_k_rad_per_m, # Store what was passed
+            'max_k_rad_per_m_input': max_k_rad_per_m,
             'k_max_calculated_rad_m': k_max,
             'num_revolutions_effective': effective_revolutions,
-            'dt_seconds_input': dt_seconds
+            'dt_seconds_input': dt_seconds,
+            'max_gradient_Tm_per_m': max_gradient_Tm_per_m,
+            'max_slew_rate_Tm_per_s': max_slew_rate_Tm_per_s,
+            'gamma_Hz_per_T_used': gamma_Hz_per_T,
+            'constraints_applied': apply_limits
         },
-        'interleaf_structure': (num_arms, num_samples_per_arm) # For Trajectory class plotting
+        'interleaf_structure': (num_arms, num_samples_per_arm)
     }
 
-    return Trajectory(name=name, 
-                      kspace_points_rad_per_m=k_space_points_rad_m, 
+    return Trajectory(name=name,
+                      kspace_points_rad_per_m=k_space_points_rad_m,
                       dt_seconds=dt_seconds,
                       metadata=metadata)
 
@@ -1848,18 +1869,23 @@ def generate_golden_angle_3d_trajectory(num_points: int,
                       metadata=metadata)
 
 
-def constrain_trajectory(trajectory: Trajectory, 
-                         max_gradient_Tm_per_m: float, 
-                         max_slew_rate_Tm_per_m_per_s: float, 
+def constrain_trajectory(trajectory: Trajectory,
+                         max_gradient_Tm_per_m: float,
+                         max_slew_rate_Tm_per_s: float, # Corrected parameter name
                          dt_seconds: Optional[float] = None) -> Trajectory:
     """
     Constrains a k-space trajectory based on maximum gradient and slew rate limits.
 
+    This function acts as a post-processing tool. Some trajectory generator functions
+    (e.g., `generate_spiral_trajectory`) may offer built-in constraint application
+    during trajectory generation. Applying this function to an already constrained
+    trajectory generated with the same limits should result in minimal changes.
+
     Args:
         trajectory (Trajectory): The input Trajectory object.
         max_gradient_Tm_per_m (float): Maximum gradient amplitude (T/m).
-        max_slew_rate_Tm_per_m_per_s (float): Maximum slew rate (T/m/s).
-        dt_seconds (Optional[float], optional): Sampling dwell time. 
+        max_slew_rate_Tm_per_s (float): Maximum slew rate (T/m/s).
+        dt_seconds (Optional[float], optional): Sampling dwell time.
                                                 If None, tries to get from trajectory.dt_seconds.
                                                 Raises ValueError if unavailable.
 
@@ -1943,9 +1969,9 @@ def constrain_trajectory(trajectory: Trajectory,
         slew_needed_Tm_s = (grad_actual_after_grad_limit_Tm - prev_grad_Tm) / dt_s
         norm_slew_needed = np.linalg.norm(slew_needed_Tm_s)
         
-        if norm_slew_needed > max_slew_rate_Tm_per_m_per_s:
+        if norm_slew_needed > max_slew_rate_Tm_per_s: # Corrected variable name
             # Scale the slew vector to the max slew rate
-            allowed_slew_Tm_s = slew_needed_Tm_s * (max_slew_rate_Tm_per_m_per_s / norm_slew_needed)
+            allowed_slew_Tm_s = slew_needed_Tm_s * (max_slew_rate_Tm_per_s / norm_slew_needed) # Corrected variable name
             # The actual gradient is the previous gradient plus the allowed slew over dt
             grad_actual_final_Tm = prev_grad_Tm + allowed_slew_Tm_s * dt_s
         else:
@@ -1958,12 +1984,18 @@ def constrain_trajectory(trajectory: Trajectory,
 
     # 7. Create a new Trajectory object
     new_metadata = trajectory.metadata.copy()
-    new_metadata['constraints'] = {
-        'max_gradient_Tm_per_m': max_gradient_Tm_per_m,
-        'max_slew_rate_Tm_per_m_per_s': max_slew_rate_Tm_per_m_per_s,
-        'dt_seconds_constraint_pass': dt_s
-    }
-    new_metadata['original_trajectory_name'] = trajectory.name
+    # Ensure 'constraints' key exists and is a dict, update it carefully
+    if 'constraints' not in new_metadata or not isinstance(new_metadata['constraints'], dict):
+        new_metadata['constraints'] = {}
+    
+    new_metadata['constraints'].update({ # Use update to preserve other constraint info if any
+        'post_processed_max_gradient_Tm_per_m': max_gradient_Tm_per_m,
+        'post_processed_max_slew_rate_Tm_per_s': max_slew_rate_Tm_per_s, # Corrected variable name
+        'post_processed_dt_seconds': dt_s,
+        'post_processing_applied': True 
+    })
+    if 'original_trajectory_name' not in new_metadata: # Preserve original name if already set
+        new_metadata['original_trajectory_name'] = trajectory.name
     
     # Ensure output k-space points have same orientation as input if it was (N,D)
     final_k_points_output = k_points_constrained_rad_m

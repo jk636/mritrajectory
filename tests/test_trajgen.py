@@ -1326,7 +1326,58 @@ class TestAdvancedTrajectoryTools(unittest.TestCase):
         # This is a qualitative check; exact values are hard to predict.
         # A simple check is that they are not identical if DC had any effect.
         if traj_radial.get_num_points() > 0:
-             self.assertFalse(np.allclose(img_dc, img_no_dc), "DC had no effect on the image.")
+        self.assertFalse(np.allclose(img_dc, img_no_dc), "DC had no effect on the image.")
+
+    def test_constrain_trajectory_on_already_constrained_spiral(self):
+        # Generate a spiral already constrained by the generator
+        fov_m = 0.2
+        dt_s = 4e-6
+        gamma_1h = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+        num_arms_spiral = 2
+        num_samples_per_arm_spiral = 64 # smaller for speed
+        
+        # These limits should be somewhat restrictive to ensure they are active
+        gen_grad_limit = 0.015  # T/m
+        gen_slew_limit = 75.0   # T/m/s
+
+        traj_constrained_by_generator = generate_spiral_trajectory(
+            num_arms=num_arms_spiral,
+            num_samples_per_arm=num_samples_per_arm_spiral,
+            fov_m=fov_m,
+            dt_seconds=dt_s,
+            gamma_Hz_per_T=gamma_1h,
+            max_gradient_Tm_per_m=gen_grad_limit,
+            max_slew_rate_Tm_per_s=gen_slew_limit 
+        )
+        self.assertTrue(traj_constrained_by_generator.metadata['generator_params']['constraints_applied'])
+
+        # Now, apply constrain_trajectory with the same (or slightly tighter) limits
+        # Using slightly tighter to account for any minor numerical differences if post-processor is more aggressive
+        post_proc_grad_limit = gen_grad_limit * 0.999 
+        post_proc_slew_limit = gen_slew_limit * 0.999
+
+        traj_post_constrained = constrain_trajectory(
+            trajectory=traj_constrained_by_generator,
+            max_gradient_Tm_per_m=post_proc_grad_limit, 
+            max_slew_rate_Tm_per_s=post_proc_slew_limit, # Corrected name here
+            dt_seconds=dt_s # Must provide dt_s
+        )
+        
+        # Check that k-space points are very close
+        np.testing.assert_allclose(
+            traj_constrained_by_generator.kspace_points_rad_per_m,
+            traj_post_constrained.kspace_points_rad_per_m,
+            atol=1e-5, # Absolute tolerance, k-space values can be small
+            rtol=1e-3, # Relative tolerance for larger k-space values
+            err_msg="constrain_trajectory significantly altered an already constrained spiral."
+        )
+        
+        # Check metadata from constrain_trajectory
+        self.assertIn('constraints', traj_post_constrained.metadata)
+        self.assertTrue(traj_post_constrained.metadata['constraints'].get('post_processing_applied'))
+        self.assertEqual(traj_post_constrained.metadata['constraints']['post_processed_max_gradient_Tm_per_m'], post_proc_grad_limit)
+        self.assertEqual(traj_post_constrained.metadata['constraints']['post_processed_max_slew_rate_Tm_per_s'], post_proc_slew_limit)
+
 
     def test_reconstruct_image_input_validation(self):
         grid_s = (16,16)
@@ -1671,6 +1722,193 @@ class TestApplyGirfConvolution(unittest.TestCase):
         output3 = apply_girf_convolution(grad_wave, girf_bipolar_short, dt_g_long, dt_h_short)
         np.testing.assert_allclose(output3, np.zeros_like(grad_wave), atol=1e-7)
 
+
+class TestGenerateSpiralTrajectoryWithLimits(unittest.TestCase):
+    def setUp(self):
+        self.fov_m = 0.256
+        self.dt_seconds = 4e-6
+        self.num_arms = 2 # Fewer arms for faster tests in some cases
+        self.num_samples_per_arm = 128 # Moderate samples
+        self.gamma_Hz_per_T = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+        self.k_max_ideal = np.pi / self.fov_m
+        self.num_revolutions = 10.0
+
+        # Generate ideal points once for comparison
+        self.ideal_k_points = self._generate_ideal_spiral_points(
+            num_arms=self.num_arms,
+            num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m,
+            max_k_rad_per_m=self.k_max_ideal, # Use calculated k_max
+            num_revolutions=self.num_revolutions
+        )
+
+    def _generate_ideal_spiral_points(self, num_arms, num_samples_per_arm, fov_m,
+                                     max_k_rad_per_m, num_revolutions):
+        # This is a simplified version of the core spiral generation logic
+        # without constraints, matching the structure used in the main function.
+        k_max_to_use = max_k_rad_per_m if max_k_rad_per_m is not None else np.pi / fov_m
+        
+        all_k_points_list = []
+        for j in range(num_arms):
+            angle_offset = j * (2 * np.pi / num_arms)
+            for s in range(num_samples_per_arm):
+                if s == 0:
+                    kx, ky = 0.0, 0.0
+                else:
+                    if num_samples_per_arm == 1: # Should be covered by s=0
+                        t_sample_ideal = 1.0 
+                    else:
+                        t_sample_ideal = s / (num_samples_per_arm - 1)
+                    
+                    ideal_radius = t_sample_ideal * k_max_to_use
+                    ideal_angle = angle_offset + num_revolutions * 2 * np.pi * t_sample_ideal
+                    kx = ideal_radius * np.cos(ideal_angle)
+                    ky = ideal_radius * np.sin(ideal_angle)
+                all_k_points_list.append(np.array([kx, ky]))
+
+        if not all_k_points_list:
+            return np.empty((2, 0))
+        return np.array(all_k_points_list).T # Transpose to (2, N)
+
+    def test_spiral_no_limits_applied(self):
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=None, max_slew_rate_Tm_per_s=None,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertFalse(traj.metadata['generator_params']['constraints_applied'])
+        np.testing.assert_allclose(traj.kspace_points_rad_per_m, self.ideal_k_points, atol=1e-6)
+
+    def test_spiral_with_very_loose_limits(self):
+        loose_grad_limit = 10.0  # T/m (extremely high)
+        loose_slew_limit = 20000.0 # T/m/s (extremely high)
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=loose_grad_limit, max_slew_rate_Tm_per_s=loose_slew_limit,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertTrue(traj.metadata['generator_params']['constraints_applied'])
+        np.testing.assert_allclose(traj.kspace_points_rad_per_m, self.ideal_k_points, atol=1e-3)
+
+
+    def test_spiral_gradient_limiting_active(self):
+        restrictive_grad_limit = 0.005 # T/m
+        very_loose_slew_limit = 10000.0 # T/m/s
+        
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=restrictive_grad_limit, max_slew_rate_Tm_per_s=very_loose_slew_limit,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertTrue(traj.metadata['generator_params']['constraints_applied'])
+        
+        max_grad_achieved = traj.get_max_grad_Tm() # This is from Trajectory class based on its k-space
+        self.assertIsNotNone(max_grad_achieved)
+        # Allow a small tolerance, e.g. 1.01 for floating point and discrete step effects
+        self.assertLessEqual(max_grad_achieved, restrictive_grad_limit * 1.01) 
+
+        max_radius_achieved = np.max(np.linalg.norm(traj.kspace_points_rad_per_m, axis=0))
+        self.assertTrue(max_radius_achieved < self.k_max_ideal * 0.99)
+
+
+    def test_spiral_slew_limiting_active(self):
+        very_loose_grad_limit = 10.0 # T/m
+        restrictive_slew_limit = 20.0 # T/m/s
+
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=very_loose_grad_limit, max_slew_rate_Tm_per_s=restrictive_slew_limit,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertTrue(traj.metadata['generator_params']['constraints_applied'])
+
+        max_slew_achieved = traj.get_max_slew_Tm_per_s()
+        self.assertIsNotNone(max_slew_achieved)
+        self.assertLessEqual(max_slew_achieved, restrictive_slew_limit * 1.01)
+
+        max_radius_achieved = np.max(np.linalg.norm(traj.kspace_points_rad_per_m, axis=0))
+        self.assertTrue(max_radius_achieved < self.k_max_ideal * 0.99)
+
+    def test_spiral_both_limits_active(self):
+        moderate_grad_limit = 0.010 # T/m
+        moderate_slew_limit = 50.0  # T/m/s
+
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=moderate_grad_limit, max_slew_rate_Tm_per_s=moderate_slew_limit,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertTrue(traj.metadata['generator_params']['constraints_applied'])
+
+        max_grad_achieved = traj.get_max_grad_Tm()
+        max_slew_achieved = traj.get_max_slew_Tm_per_s()
+        self.assertIsNotNone(max_grad_achieved)
+        self.assertIsNotNone(max_slew_achieved)
+        self.assertLessEqual(max_grad_achieved, moderate_grad_limit * 1.01)
+        self.assertLessEqual(max_slew_achieved, moderate_slew_limit * 1.01)
+        
+        max_radius_achieved = np.max(np.linalg.norm(traj.kspace_points_rad_per_m, axis=0))
+        self.assertTrue(max_radius_achieved < self.k_max_ideal * 0.99)
+
+    def test_spiral_metadata_constraints(self):
+        grad_limit = 0.02
+        slew_limit = 100.0
+        traj = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds, gamma_Hz_per_T=self.gamma_Hz_per_T,
+            max_gradient_Tm_per_m=grad_limit, max_slew_rate_Tm_per_s=slew_limit,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        gp = traj.metadata['generator_params']
+        self.assertTrue(gp['constraints_applied'])
+        self.assertEqual(gp['max_gradient_Tm_per_m'], grad_limit)
+        self.assertEqual(gp['max_slew_rate_Tm_per_s'], slew_limit)
+        self.assertEqual(gp['gamma_Hz_per_T_used'], self.gamma_Hz_per_T)
+
+    def test_spiral_zero_or_negative_limits_behavior(self):
+        traj_zero_grad = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds,
+            max_gradient_Tm_per_m=0, max_slew_rate_Tm_per_s=100.0,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertFalse(traj_zero_grad.metadata['generator_params']['constraints_applied'])
+        np.testing.assert_allclose(traj_zero_grad.kspace_points_rad_per_m, self.ideal_k_points, atol=1e-6)
+
+        traj_zero_slew = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds,
+            max_gradient_Tm_per_m=0.04, max_slew_rate_Tm_per_s=0,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertFalse(traj_zero_slew.metadata['generator_params']['constraints_applied'])
+        np.testing.assert_allclose(traj_zero_slew.kspace_points_rad_per_m, self.ideal_k_points, atol=1e-6)
+
+        traj_neg_grad = generate_spiral_trajectory(
+            num_arms=self.num_arms, num_samples_per_arm=self.num_samples_per_arm,
+            fov_m=self.fov_m, dt_seconds=self.dt_seconds,
+            max_gradient_Tm_per_m=-0.04, max_slew_rate_Tm_per_s=100.0,
+            num_revolutions=self.num_revolutions, max_k_rad_per_m=self.k_max_ideal
+        )
+        self.assertFalse(traj_neg_grad.metadata['generator_params']['constraints_applied'])
+        np.testing.assert_allclose(traj_neg_grad.kspace_points_rad_per_m, self.ideal_k_points, atol=1e-6)
+
+    def test_spiral_invalid_dt_or_gamma_with_limits(self):
+        with self.assertRaisesRegex(ValueError, "dt_seconds must be positive when applying gradient/slew limits"):
+            generate_spiral_trajectory(
+                num_arms=1, num_samples_per_arm=10, fov_m=self.fov_m, dt_seconds=0,
+                max_gradient_Tm_per_m=0.01, max_slew_rate_Tm_per_s=50.0
+            )
+        with self.assertRaisesRegex(ValueError, "gamma_Hz_per_T must be positive when applying gradient/slew limits"):
+            generate_spiral_trajectory(
+                num_arms=1, num_samples_per_arm=10, fov_m=self.fov_m, dt_seconds=self.dt_seconds,
+                gamma_Hz_per_T=0, max_gradient_Tm_per_m=0.01, max_slew_rate_Tm_per_s=50.0
+            )
 
 if __name__ == '__main__':
     unittest.main()
