@@ -1,0 +1,18 @@
+test_trajgen (unittest.loader._FailedTest) ... ERROR
+
+======================================================================
+ERROR: test_trajgen (unittest.loader._FailedTest)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_trajgen
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/unittest/loader.py", line 154, in loadTestsFromName
+    module = __import__(module_name)
+  File "/app/tests/test_trajgen.py", line 9, in <module>
+    from trajgen import Trajectory, KSpaceTrajectoryGenerator, COMMON_NUCLEI_GAMMA_HZ_PER_T
+ImportError: cannot import name 'KSpaceTrajectoryGenerator' from 'trajgen' (/app/trajgen.py)
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
