@@ -8,8 +8,8 @@ import contextlib
 # Add the parent directory to the Python path to allow importing trajgen
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from trajgen import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
-from trajgen import normalize_density_weights, create_periodic_points, compute_density_compensation, compute_voronoi_density #, compute_cell_area # For new test class
+from trajgen.trajectory import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
+from trajgen.trajectory import normalize_density_weights, create_periodic_points, compute_density_compensation, compute_voronoi_density #, compute_cell_area # For new test class
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -50,8 +50,10 @@ class TestTrajectory(unittest.TestCase):
         self.kspace_empty_2d = np.empty((2,0))
         self.kspace_empty_3d = np.empty((3,0))
 
-        self.kspace_voronoi_good = np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5]]).T
-        self.kspace_voronoi_bad = np.array([[0,0],[1,0]]).T
+        self.kspace_voronoi_good = np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5]]).T # D=2, N=5
+        self.kspace_voronoi_bad = np.array([[0,0],[1,0]]).T # D=2, N=2 (too few for Voronoi)
+        self.kspace_voronoi_1d_for_test = np.array([[-1, 0, 1, 2, 3]]).T # N=5, D=1 (when transposed in class) -> (1,5) in class
+        self.kspace_voronoi_3d_for_test = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0.5,0.5,0.5]]).T # D=3, N=5
 
     def tearDown(self):
         plt.close('all')
@@ -302,32 +304,153 @@ class TestTrajectory(unittest.TestCase):
         self.assertIsInstance(returned_ax_recreated, Axes3D)
         self.assertIsNot(returned_ax_recreated, ax_2d_passed)
         plt.close('all')
-        
-    def test_plot_voronoi_detailed(self):
-        traj_empty = Trajectory("voronoi_empty", self.kspace_empty_2d)
-        ax = traj_empty.plot_voronoi(); self.assertIsNone(ax)
-        plt.close('all')
-        
-        traj_1d = Trajectory("voronoi_1d", self.kspace_1d)
-        ax = traj_1d.plot_voronoi(); self.assertIsNone(ax)
+
+# Removed old test_plot_voronoi_detailed as it's replaced by TestTrajectoryPlotVoronoi
+
+class TestTrajectoryCalculateVoronoiDensity(unittest.TestCase):
+    def setUp(self):
+        self.dt = 4e-6
+        self.kspace_2d_simple = np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5]]).T # 2x5
+        self.kspace_1d_simple = np.array([[-1, 0, 1, 2, 3]]) # 1x5
+        self.kspace_3d_simple = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0.5,0.5,0.5]]).T # 3x5
+        self.kspace_empty = np.empty((2,0))
+        self.kspace_2d_insufficient = np.array([[0,0],[1,0]]).T # 2x2
+
+    def tearDown(self):
         plt.close('all')
 
-        traj_3d = Trajectory("voronoi_3d", self.kspace_3d_plot_test)
-        ax = traj_3d.plot_voronoi(); self.assertIsInstance(ax, Axes3D)
-        plt.close('all')
+    def test_calculate_voronoi_2d(self):
+        traj = Trajectory("vor_2d", self.kspace_2d_simple, dt_seconds=self.dt)
+        weights = traj.calculate_voronoi_density()
+        self.assertEqual(traj.metadata['voronoi_calculation_status'], "Success")
+        self.assertIsNotNone(weights)
+        self.assertEqual(weights.shape, (self.kspace_2d_simple.shape[1],))
+        self.assertAlmostEqual(np.sum(weights), 1.0, places=5)
+        self.assertIn('density_compensation_weights_voronoi', traj.metadata)
+        self.assertIn('voronoi_cell_sizes', traj.metadata)
+        np.testing.assert_array_equal(traj.metadata['density_compensation_weights_voronoi'], weights)
+        np.testing.assert_array_equal(traj.metadata['voronoi_cell_sizes'], weights)
 
-        traj_good_2d = Trajectory("voronoi_good", self.kspace_voronoi_good)
-        ax = traj_good_2d.plot_voronoi();
-        self.assertIsInstance(ax, plt.Axes, "Plotting good 2D Voronoi should return Axes.")
-        plt.close('all')
-        ax_params = traj_good_2d.plot_voronoi(color_by_area=False, show_vertices=True)
-        self.assertIsInstance(ax_params, plt.Axes)
-        plt.close('all')
+        # Test force_recompute
+        traj.metadata['voronoi_calculation_status'] = "Old Status"
+        weights_recomputed = traj.calculate_voronoi_density(force_recompute=True)
+        self.assertEqual(traj.metadata['voronoi_calculation_status'], "Success")
+        np.testing.assert_array_almost_equal(weights, weights_recomputed)
 
-        traj_bad_2d = Trajectory("voronoi_bad", self.kspace_voronoi_bad)
-        ax = traj_bad_2d.plot_voronoi()
-        self.assertIsNone(ax, "Plotting bad 2D Voronoi should ideally return None or handle gracefully.")
-        plt.close('all')
+
+    def test_calculate_voronoi_1d(self):
+        # compute_voronoi_density internally handles 1D by returning uniform weights if it can't process
+        # The Trajectory class method should reflect this behavior.
+        traj = Trajectory("vor_1d", self.kspace_1d_simple, dt_seconds=self.dt)
+        weights = traj.calculate_voronoi_density()
+        self.assertEqual(traj.get_num_dimensions(), 1)
+        # The compute_voronoi_density function has a check:
+        # if ndim not in [2, 3]: raise ValueError(...)
+        # So this should result in an error status if compute_voronoi_density is called directly with 1D
+        # Let's check the behavior of the class method given this.
+        # The helper `compute_density_compensation` (not directly used by Trajectory's method) has a fallback for 1D.
+        # However, `Trajectory.calculate_voronoi_density` calls `compute_voronoi_density` directly.
+        # `compute_voronoi_density` raises ValueError for ndim not in [2,3].
+        self.assertTrue(traj.metadata['voronoi_calculation_status'].startswith("Error: Number of dimensions (ndim=1) must be 2 or 3"))
+        self.assertIsNone(weights)
+        self.assertIsNone(traj.metadata.get('density_compensation_weights_voronoi'))
+
+
+    def test_calculate_voronoi_3d(self):
+        traj = Trajectory("vor_3d", self.kspace_3d_simple, dt_seconds=self.dt)
+        weights = traj.calculate_voronoi_density()
+        self.assertEqual(traj.metadata['voronoi_calculation_status'], "Success")
+        self.assertIsNotNone(weights)
+        self.assertEqual(weights.shape, (self.kspace_3d_simple.shape[1],))
+        self.assertAlmostEqual(np.sum(weights), 1.0, places=5)
+        self.assertIn('density_compensation_weights_voronoi', traj.metadata)
+
+    def test_calculate_voronoi_empty(self):
+        traj = Trajectory("vor_empty", self.kspace_empty, dt_seconds=self.dt)
+        weights = traj.calculate_voronoi_density()
+        self.assertEqual(traj.metadata['voronoi_calculation_status'], "Skipped: No k-space points")
+        self.assertIsNotNone(weights) # Should be an empty array
+        self.assertEqual(weights.size, 0)
+        self.assertIsNone(traj.metadata.get('density_compensation_weights_voronoi'))
+
+
+    def test_calculate_voronoi_insufficient_points(self):
+        # compute_voronoi_density has: if unique_pts.shape[0] < ndim + 1: return normalize_density_weights(np.ones(num_points))
+        traj = Trajectory("vor_insufficient", self.kspace_2d_insufficient, dt_seconds=self.dt)
+        self.assertEqual(traj.get_num_points(), 2)
+        self.assertEqual(traj.get_num_dimensions(), 2)
+        weights = traj.calculate_voronoi_density()
+        # This should now return uniform weights as per compute_voronoi_density's fallback
+        self.assertEqual(traj.metadata['voronoi_calculation_status'], "Success")
+        self.assertIsNotNone(weights)
+        self.assertEqual(weights.shape, (self.kspace_2d_insufficient.shape[1],))
+        np.testing.assert_array_almost_equal(weights, np.full(self.kspace_2d_insufficient.shape[1], 1.0/self.kspace_2d_insufficient.shape[1]))
+        self.assertAlmostEqual(np.sum(weights), 1.0, places=5)
+
+class TestTrajectoryPlotVoronoi(unittest.TestCase):
+    def setUp(self):
+        self.kspace_2d = np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5]]).T # 2x5
+        self.kspace_3d = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0.5,0.5,0.5]]).T # 3x5
+        self.kspace_1d = np.array([[-1, 0, 1, 2, 3]]) # 1x5
+        self.kspace_empty = np.empty((2,0))
+        self.kspace_2d_few_points = np.array([[0,0],[1,0]]).T # 2x2
+
+    def tearDown(self):
+        plt.close('all') # Ensure all figures are closed after each test
+
+    def test_plot_voronoi_2d(self):
+        traj = Trajectory("plot_vor_2d", self.kspace_2d)
+        ax = traj.plot_voronoi(title="Test 2D Voronoi")
+        self.assertIsInstance(ax, plt.Axes)
+        self.assertTrue(ax.get_title() == "Test 2D Voronoi")
+        self.assertTrue(len(ax.collections) > 0 or len(ax.lines) > 0) # Check if something was plotted
+
+    def test_plot_voronoi_3d(self):
+        traj = Trajectory("plot_vor_3d", self.kspace_3d)
+        # Should fall back to plot_3d
+        ax = traj.plot_voronoi(title="Test 3D Voronoi Fallback")
+        self.assertIsInstance(ax, Axes3D) # plot_3d returns Axes3D
+        self.assertTrue("3D Scatter Fallback" in ax.get_title())
+
+    def test_plot_voronoi_1d(self):
+        traj = Trajectory("plot_vor_1d", self.kspace_1d)
+        ax = traj.plot_voronoi(title="Test 1D Voronoi")
+        self.assertIsInstance(ax, plt.Axes)
+        self.assertTrue("(1D points)" in ax.get_title())
+        self.assertTrue(len(ax.lines) > 0) # Should plot points
+
+    def test_plot_voronoi_empty(self):
+        traj = Trajectory("plot_vor_empty", self.kspace_empty)
+        ax = traj.plot_voronoi(title="Test Empty Voronoi")
+        self.assertIsInstance(ax, plt.Axes)
+        self.assertTrue("(No points)" in ax.get_title())
+
+    def test_plot_voronoi_with_ax(self):
+        traj = Trajectory("plot_vor_2d_ax", self.kspace_2d)
+        fig, existing_ax = plt.subplots()
+        returned_ax = traj.plot_voronoi(ax=existing_ax, title="Test Existing Ax")
+        self.assertIs(returned_ax, existing_ax)
+        self.assertTrue(returned_ax.get_title() == "Test Existing Ax")
+
+    def test_plot_voronoi_2d_few_points(self):
+        # Not enough points for Voronoi, should plot points
+        traj = Trajectory("plot_vor_2d_few", self.kspace_2d_few_points)
+        ax = traj.plot_voronoi(title="Test Few Points")
+        self.assertIsInstance(ax, plt.Axes)
+        self.assertTrue("(Too few points for Voronoi)" in ax.get_title())
+        self.assertTrue(len(ax.lines) > 0) # Check points are plotted
+
+    def test_plot_voronoi_2d_clip_boundary(self):
+        traj = Trajectory("plot_vor_2d_clip", self.kspace_2d)
+        ax = traj.plot_voronoi(title="Test Clip Boundary", clip_boundary_m=1.0)
+        self.assertIsInstance(ax, plt.Axes)
+        self.assertEqual(ax.get_xlim(), (-1.0, 1.0))
+        self.assertEqual(ax.get_ylim(), (-1.0, 1.0))
+        # Check if patches were added (even if empty, collection might be there)
+        # or points if Voronoi failed but still within clip.
+        # This test mainly ensures the API for clipping is hit and plot limits are set.
+        self.assertTrue(len(ax.collections) > 0 or len(ax.lines) > 0)
+
 
 class TestTrajectoryHelperFunctions(unittest.TestCase):
     def setUp(self):
