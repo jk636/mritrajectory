@@ -19,19 +19,25 @@ class TestTrajectoryPlanner(unittest.TestCase):
         self.dt = 4e-6  # seconds
         self.gamma = DEFAULT_GAMMA_PROTON
         self.constraints = {
-            'Gmax_T_per_m': 0.040,
-            'Smax_T_per_m_per_s': 180.0,
-            'PNS_threshold_factor': 0.8, # This might be used by PNSModel if it looks for it
-                                         # Or PNSModel thresholds are set directly
-            'pns_model_thresholds': { # More explicit way to set PNSModel thresholds
+            'Gmax_T_per_m': 0.040, # T/m
+            'Smax_T_per_m_per_s': 180.0, # T/m/s
+            'Smax_vector_T_per_m_per_s': 200.0, # T/m/s
+            'pns_model_thresholds': {
                 'rheobase_T_per_s': 22.0,
                 'chronaxie_ms': 0.40,
                 'max_total_pns_normalized': 0.85
-            }
+            },
+            'tolerance': 1e-7,
+            'thermal_limits': { # Added for thermal tests
+                'x': {'max_duty_cycle_percent': 50.0},
+                'y': {'max_duty_cycle_percent': 60.0},
+                # 'z' axis has no explicit duty cycle limit in this test config
+            },
+            'thermal_duty_cycle_active_threshold_factor': 0.1 # 10% of Gmax
         }
         self.num_points = 256
 
-        # Dummy GIRF (identity)
+        # Dummy GIRF (identity for x, attenuated for y)
         self.dummy_girf_spectra = {
             'x': np.ones(self.num_points, dtype=np.complex128),
             'y': np.ones(self.num_points, dtype=np.complex128)
@@ -113,30 +119,78 @@ class TestTrajectoryPlanner(unittest.TestCase):
         grads_hw_ok[1,0] = slews_ok_val * self.dt
         grads_hw_ok[:,:] = np.clip(grads_hw_ok, -grads_ok_val, grads_ok_val) # Ensure Gmax is also met
         # Manually ensure Gmax is met for the specific point we set for slew rate
-        grads_hw_ok[1,0] = min(grads_ok_val, slews_ok_val * self.dt)
+        # Ensure Gmax is met for the specific point we set for slew rate
+        test_grad_val_for_slew = min(grads_ok_val, slews_ok_val * self.dt)
+        grads_hw_ok[1,0] = test_grad_val_for_slew
+        grads_hw_ok[1,1] = test_grad_val_for_slew / 2
 
 
-        hw_ok, violations = self.planner._check_hardware_constraints(grads_hw_ok)
-        self.assertTrue(hw_ok, f"HW constraints failed unexpectedly. Violations: {violations}")
+        overall_ok, hw_report = self.planner._check_hardware_constraints(grads_hw_ok)
+        self.assertTrue(overall_ok, f"HW constraints failed unexpectedly. Report: {hw_report}")
+        self.assertTrue(hw_report['G_ok'], f"Gmax check failed: {hw_report.get('G_details')}")
+        self.assertTrue(hw_report['S_axis_ok'], f"Smax_axis check failed: {hw_report.get('S_axis_details')}")
+        if self.planner.constraints.get('Smax_vector_T_per_m_per_s') is not None: # Check only if Smax_vector is defined
+            self.assertTrue(hw_report['S_vector_ok'], f"Smax_vector check failed: {hw_report.get('S_vector_details')}")
+
 
         # Gradients that violate Gmax
         grads_gmax_viol = np.zeros((self.num_points, 2))
-        grads_gmax_viol[10,0] = self.constraints['Gmax_T_per_m'] * 1.1 # Exceed Gmax
-        hw_ok_g, violations_g = self.planner._check_hardware_constraints(grads_gmax_viol)
-        self.assertFalse(hw_ok_g)
-        self.assertIn('Gmax', violations_g)
+        grads_gmax_viol[10,0] = self.constraints['Gmax_T_per_m'] * 1.1
+        overall_ok_g, hw_report_g = self.planner._check_hardware_constraints(grads_gmax_viol)
+        self.assertFalse(overall_ok_g)
+        self.assertFalse(hw_report_g['G_ok'])
+        self.assertIn('first_exceeding_value_T_per_m', hw_report_g['G_details'])
 
-        # Gradients that violate Smax
-        grads_smax_viol = np.zeros((self.num_points, 2))
-        # g[0]=0, g[1] = Smax_limit * 1.1 * dt
-        grads_smax_viol[1,0] = self.constraints['Smax_T_per_m_per_s'] * 1.1 * self.dt
-        # Ensure this gradient itself does not violate Gmax too much to isolate Smax violation
-        grads_smax_viol[1,0] = min(grads_smax_viol[1,0], self.constraints['Gmax_T_per_m'])
+        # Gradients that violate Smax (per-axis)
+        grads_smax_axis_viol = np.zeros((self.num_points, 2))
+        smax_axis = self.constraints['Smax_T_per_m_per_s']
+        # Ensure grad value itself is within Gmax to isolate Smax violation
+        grads_smax_axis_viol[1,0] = min(self.constraints['Gmax_T_per_m'], smax_axis * 1.1 * self.dt)
 
+        overall_ok_sa, hw_report_sa = self.planner._check_hardware_constraints(grads_smax_axis_viol)
+        self.assertFalse(overall_ok_sa)
+        self.assertFalse(hw_report_sa['S_axis_ok'])
+        self.assertIn('first_exceeding_value_T_per_m_per_s', hw_report_sa['S_axis_details'])
 
-        hw_ok_s, violations_s = self.planner._check_hardware_constraints(grads_smax_viol)
-        self.assertFalse(hw_ok_s, f"Smax should be violated. Violations: {violations_s}, Max Grad found: {np.max(np.abs(grads_smax_viol))}, Slew for point 1,0: {grads_smax_viol[1,0]/self.dt}")
-        self.assertIn('Smax', violations_s)
+        # Gradients that violate Smax_vector but not necessarily per-axis Smax
+        smax_vec = self.constraints.get('Smax_vector_T_per_m_per_s')
+        if smax_vec is not None: # Only run this part if Smax_vector is defined
+            smax_axis_val = self.constraints['Smax_T_per_m_per_s']
+            # Want individual slews < smax_axis_val, but sqrt(slew_x^2 + slew_y^2) > smax_vec
+            # Example: smax_axis = 180, smax_vec = 200.
+            # slew_x = 150, slew_y = 150. Both < 180. sqrt(150^2+150^2) = 212 > 200.
+            # Need to ensure grad values for these slews don't exceed Gmax
+
+            # Target slew for each component:
+            # Choose a value that is below smax_axis_val but whose vector sum (if on multiple axes) exceeds smax_vec
+            # e.g. each component = smax_vec / sqrt(num_active_axes) * 0.8 (to be under smax_axis if smax_axis is close to smax_vec/sqrt(N))
+            # and also smax_vec * 0.8 (if only one component is this large, it must also be < smax_axis)
+            # This needs careful construction. Let's try specific values.
+            # If smax_axis = 180, smax_vec = 200.
+            # Set slew_x = 170, slew_y = 170. Vector = sqrt(170^2+170^2) = 170*sqrt(2) = 240.4 > 200.
+            # And 170 < 180 (per-axis Smax).
+            slew_comp_val = 170.0
+            if slew_comp_val >= smax_axis_val : # Adjust if our chosen val is too high for per-axis
+                slew_comp_val = smax_axis_val * 0.95
+
+            # Ensure vector sum will violate if possible with this slew_comp_val
+            # (slew_comp_val * sqrt(2) > smax_vec)
+            if slew_comp_val * np.sqrt(2) < smax_vec: # if this test setup is not good for the current constraints
+                print(f"Skipping Smax_vector specific violation test part as chosen slew_comp_val ({slew_comp_val}) times sqrt(2) is not greater than Smax_vector ({smax_vec})")
+            else:
+                grads_smax_vec_viol = np.zeros((self.num_points, 2))
+                grad_for_slew_comp = min(self.constraints['Gmax_T_per_m'], slew_comp_val * self.dt)
+
+                grads_smax_vec_viol[1,0] = grad_for_slew_comp
+                grads_smax_vec_viol[1,1] = grad_for_slew_comp
+
+                overall_ok_sv, hw_report_sv = self.planner._check_hardware_constraints(grads_smax_vec_viol)
+                self.assertFalse(overall_ok_sv, f"Smax_vector should be violated. Report: {hw_report_sv}")
+                self.assertTrue(hw_report_sv['S_axis_ok'], f"S_axis_ok should be true for this Smax_vector test. Report: {hw_report_sv}")
+                self.assertFalse(hw_report_sv['S_vector_ok'], f"S_vector_ok should be false. Report: {hw_report_sv}")
+                self.assertIn('first_exceeding_vector_value_T_per_m_per_s', hw_report_sv['S_vector_details'])
+        else:
+            print("Skipping Smax_vector specific violation test as Smax_vector_T_per_m_per_s not in constraints.")
 
 
     def test_05_design_trajectory_spiral(self):
@@ -194,18 +248,23 @@ class TestTrajectoryPlanner(unittest.TestCase):
         # Case 1: Should pass (hopefully, with low k_max)
         # May need to adjust constraints or trajectory params for this to pass reliably
         # Forcing PNS model to be very lenient for this test part
-        original_pns_thresholds = self.planner.pns_model.pns_thresholds
-        self.planner.pns_model.pns_thresholds = {'max_total_pns_normalized': 10.0, # Very high limit
-                                                 'rheobase_T_per_s': 200.0, 'chronaxie_ms': 0.36}
+        if self.planner.pns_model: # Check if PNS model was successfully instantiated
+            original_pns_thresholds = self.planner.pns_model.pns_thresholds.copy()
+            self.planner.pns_model.pns_thresholds['max_total_pns_normalized'] = 10.0 # Very high limit
+            self.planner.pns_model.pns_thresholds['rheobase_T_per_s'] = 200.0
 
-        hw_ok, pns_ok, report = self.planner.verify_constraints(grads_to_check, pns_check=True)
-        # These assertions depend heavily on the generated trajectory and specific constraint values.
-        # For a unit test, it might be better to use carefully crafted gradient inputs.
-        # self.assertTrue(hw_ok, f"Nominal trajectory failed HW check: {report.get('hw_violations')}")
-        # self.assertTrue(pns_ok, f"Nominal trajectory failed PNS check: {report.get('pns_report')}")
-        self.assertIsInstance(hw_ok, bool) # Just check they run
+        overall_hw_status, pns_ok, report = self.planner.verify_constraints(grads_to_check, pns_check=True)
+
+        self.assertIsInstance(overall_hw_status, bool)
         self.assertIsInstance(pns_ok, bool)
-        self.planner.pns_model.pns_thresholds = original_pns_thresholds # Restore
+        self.assertIn('hw_report', report)
+        self.assertIn('pns_report', report)
+
+        # Example: Check if overall hardware status is reflected in the report
+        self.assertEqual(overall_hw_status, report['hw_report']['overall_ok'])
+
+        if self.planner.pns_model:
+            self.planner.pns_model.pns_thresholds = original_pns_thresholds # Restore
 
 
         # Case 2: Introduce a clear violation for Gmax
@@ -214,19 +273,84 @@ class TestTrajectoryPlanner(unittest.TestCase):
 
         hw_ok_f, _, report_f = self.planner.verify_constraints(grads_gmax_fail, pns_check=False) # PNS check off
         self.assertFalse(hw_ok_f)
-        self.assertIn('Gmax', report_f['hw_violations'])
+        self.assertFalse(report_f['hw_report']['G_ok'])
+        self.assertIn('first_exceeding_value_T_per_m', report_f['hw_report']['G_details'])
 
 
     def test_09_verify_constraints_no_pns_model(self):
         # Test verify_constraints when PNS model is not available in planner
-        self.planner.pns_model = None
-        self.planner.design_trajectory(traj_type='spiral', design_params={'num_points': self.num_points})
-        grads_to_check = self.planner.nominal_gradients_time
-        hw_ok, pns_ok, report = self.planner.verify_constraints(grads_to_check, pns_check=True)
+        planner_no_pns = TrajectoryPlanner(girf_spectra=self.dummy_girf_spectra,
+                                           constraints=self.constraints, dt=self.dt, gamma=self.gamma,
+                                           pns_model_instance=None, # Explicitly None
+                                           trajectory_predictor_instance=self.predictor_inst)
+
+        planner_no_pns.design_trajectory(traj_type='spiral', design_params={'num_points': self.num_points})
+        grads_to_check = planner_no_pns.nominal_gradients_time
+        hw_ok, pns_ok, report = planner_no_pns.verify_constraints(grads_to_check, pns_check=True)
 
         self.assertIsInstance(hw_ok, bool) # HW check should still run
         self.assertTrue(pns_ok) # PNS should be true (or "not applicable") if model is None
         self.assertEqual(report['pns_report']['status'], "Not Checked")
+
+    # --- Tests for Thermal Related Methods ---
+    def test_10_calculate_gradient_duty_cycles(self):
+        # Create a waveform: 50% of points are >= 0.1 * Gmax
+        gmax_val = self.constraints['Gmax_T_per_m']
+        active_thresh_factor = self.constraints['thermal_duty_cycle_active_threshold_factor'] # 0.1
+        threshold = active_thresh_factor * gmax_val # 0.1 * 0.04 = 0.004
+
+        wf_x = np.zeros(self.num_points)
+        wf_x[:self.num_points // 2] = threshold * 1.5 # First half is active
+        wf_y = np.ones(self.num_points) * threshold * 0.5 # All points inactive
+
+        grads_dict = {'x': wf_x, 'y': wf_y}
+        duty_cycles = self.planner.calculate_gradient_duty_cycles(grads_dict)
+
+        self.assertAlmostEqual(duty_cycles['x'], 50.0)
+        self.assertAlmostEqual(duty_cycles['y'], 0.0)
+
+        # Test with Gmax_axis specific (if planner was configured with Gmax_x etc.)
+        # For now, it uses the global Gmax_T_per_m from constraints if Gmax_axis not found in constraints.
+        # If self.constraints had 'Gmax_x_T_per_m': 0.02, then threshold for x would be 0.002.
+        # Let's test that Gmax fallback
+        planner_global_gmax = TrajectoryPlanner(constraints={'Gmax_T_per_m': 0.05, 'thermal_duty_cycle_active_threshold_factor': 0.1}, dt=self.dt)
+        wf_g_global_test = np.zeros(100)
+        wf_g_global_test[:30] = 0.005 # 0.005 is 0.1 * 0.05 (Gmax)
+        duty_global = planner_global_gmax.calculate_gradient_duty_cycles({'testax': wf_g_global_test})
+        self.assertAlmostEqual(duty_global['testax'], 30.0)
+
+
+    def test_11_check_thermal_limits_conceptual(self):
+        # X: 50% duty, limit 50% -> OK
+        # Y: 70% duty, limit 60% -> Fail
+        # Z: 30% duty, no limit defined -> OK (as per current logic)
+        gmax_val = self.constraints['Gmax_T_per_m']
+        active_thresh_factor = self.constraints['thermal_duty_cycle_active_threshold_factor']
+        threshold = active_thresh_factor * gmax_val
+
+        wf_x = np.zeros(self.num_points); wf_x[:int(0.50 * self.num_points)] = threshold * 2.0
+        wf_y = np.zeros(self.num_points); wf_y[:int(0.70 * self.num_points)] = threshold * 2.0
+        wf_z = np.zeros(self.num_points); wf_z[:int(0.30 * self.num_points)] = threshold * 2.0
+
+        grads_for_thermal_test = {'x': wf_x, 'y': wf_y, 'z': wf_z}
+
+        thermal_results = self.planner.check_thermal_limits_conceptual(grads_for_thermal_test)
+
+        self.assertFalse(thermal_results['thermal_ok']) # Overall should be False due to Y
+        self.assertTrue(thermal_results['details']['x']['is_ok'])
+        self.assertAlmostEqual(thermal_results['details']['x']['duty_cycle_percent'], 50.0)
+        self.assertFalse(thermal_results['details']['y']['is_ok'])
+        self.assertAlmostEqual(thermal_results['details']['y']['duty_cycle_percent'], 70.0)
+        self.assertTrue(thermal_results['details']['z']['is_ok']) # No limit for Z, so OK
+        self.assertIn('No duty cycle limit defined for axis z', thermal_results['details']['z']['message'])
+
+        # Test with no thermal limits in config
+        constraints_no_thermal = self.constraints.copy()
+        del constraints_no_thermal['thermal_limits']
+        planner_no_thermal_cfg = TrajectoryPlanner(constraints=constraints_no_thermal, dt=self.dt)
+        no_thermal_res = planner_no_thermal_cfg.check_thermal_limits_conceptual(grads_for_thermal_test)
+        self.assertTrue(no_thermal_res['thermal_ok'])
+        self.assertIn('No thermal_limits defined', no_thermal_res['message'])
 
 
 if __name__ == '__main__':

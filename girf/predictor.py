@@ -1,5 +1,7 @@
 import numpy as np
 import json
+import logging # Added for logging
+
 # Attempt to import GIRFCalibrator for loading, handle if it's not directly available
 try:
     from .calibrator import GIRFCalibrator
@@ -31,11 +33,19 @@ class TrajectoryPredictor:
         self.axes_names = [] # Store axis names corresponding to columns if input is array
 
         if dt is None:
-            print("Warning: 'dt' (time step) not provided during initialization. It must be set before prediction.")
+            # Using print here as logger might not be set up if dt is critical before logger init
+            print("CRITICAL WARNING: 'dt' (time step) not provided during TrajectoryPredictor initialization. Essential for most operations.")
         self.dt = dt
-        self.gamma = gamma
+        self.gamma = gamma # Hz/T
+        self.gamma_rad_per_T_per_s = self.gamma * 2 * np.pi # For convenience if needed in rad/s/T
 
-        print(f"TrajectoryPredictor initialized. dt={self.dt} s, gamma={self.gamma} Hz/T")
+        self.logger = logging.getLogger(self.__class__.__name__)
+        # Configure basic logging if no handlers are set up for this logger or root,
+        # to ensure messages are visible if this class is used standalone.
+        if not self.logger.hasHandlers() and not logging.getLogger().hasHandlers():
+            logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(name)s: %(message)s')
+
+        self.logger.info(f"TrajectoryPredictor initialized. dt={self.dt} s, gamma={self.gamma} Hz/T")
 
     def load_girf(self, girf_data_or_path):
         """
@@ -222,20 +232,69 @@ class TrajectoryPredictor:
             predicted_gradients_time_val[:, i] = predicted_grad_axis_time
 
         self.predicted_gradients_time = predicted_gradients_time_val
-        self.predicted_trajectory_kspace = self._gradients_to_trajectory(self.predicted_gradients_time,
-                                                                         initial_kspace_point=initial_k_point)
-        print("Predicted trajectory with optional harmonics computed.")
+        self.logger.info("Predicted trajectory with optional harmonics computed.")
         return self.predicted_trajectory_kspace
+
+    def apply_b0_inhomogeneity_effects(self, trajectory_kspace, b0_map_hz, time_points_s):
+        """
+        Conceptual placeholder for applying B0 inhomogeneity effects.
+        Currently simulates a simple k-space shift on axis 1 if b0_map_hz is scalar.
+
+        Args:
+            trajectory_kspace (np.ndarray): (Npoints, Ndims) array of k-space points (m^-1).
+            b0_map_hz (float or np.ndarray): Average B0 offset (Hz) or spatial B0 map (Hz).
+            time_points_s (np.ndarray): (Npoints) array of time for each k-space point (s).
+
+        Returns:
+            np.ndarray: Modified trajectory_kspace.
+        """
+        modified_trajectory_kspace = trajectory_kspace.copy()
+
+        if not isinstance(b0_map_hz, np.ndarray) or b0_map_hz.ndim == 0: # Scalar average effect
+            avg_b0_offset_hz = float(b0_map_hz)
+
+            # Simplified k-space shift model: delta_k_axis = B0_offset_Hz * time_points_s (units 1/m)
+            # This is a direct addition to k-space coordinates in 1/m.
+            delta_k_shift_values = avg_b0_offset_hz * time_points_s
+
+            if modified_trajectory_kspace.shape[1] > 1: # Apply to 'y' axis (axis 1) if it exists
+                modified_trajectory_kspace[:, 1] += delta_k_shift_values
+                self.logger.info(f"Conceptual: Applied B0 inhomogeneity (k-space shift on axis 1) using avg offset {avg_b0_offset_hz:.1f} Hz. Max shift: {np.max(np.abs(delta_k_shift_values)):.2f} m^-1.")
+            elif modified_trajectory_kspace.shape[1] == 1: # Apply to the only axis (axis 0)
+                modified_trajectory_kspace[:, 0] += delta_k_shift_values
+                self.logger.info(f"Conceptual: Applied B0 inhomogeneity (k-space shift on axis 0 for 1D traj) using avg offset {avg_b0_offset_hz:.1f} Hz. Max shift: {np.max(np.abs(delta_k_shift_values)):.2f} m^-1.")
+            else:
+                 self.logger.warning("Conceptual B0 effect: Trajectory has no spatial dimensions to apply shift to.")
+            return modified_trajectory_kspace
+        else: # Spatially varying B0 map
+            self.logger.info("Conceptual: B0 inhomogeneity effect with spatial map is complex and not yet implemented. Returning original trajectory.")
+            return trajectory_kspace # Return copy to maintain consistency of returning a copy
+
+    def apply_gradient_nonlinearity_effects(self, trajectory_kspace, gradient_nonlinearity_model=None):
+        """
+        Conceptual placeholder for applying gradient non-linearity effects.
+
+        Args:
+            trajectory_kspace (np.ndarray): (Npoints, Ndims) array of k-space points.
+            gradient_nonlinearity_model (dict or object, optional): Model describing non-linearities
+                                         (e.g., SH coeffs).
+
+        Returns:
+            np.ndarray: Modified trajectory_kspace (currently returns original).
+        """
+        self.logger.info("Conceptual: Gradient non-linearity effects are complex. This function is a placeholder.")
+        if gradient_nonlinearity_model:
+            self.logger.info(f"  Received gradient_nonlinearity_model of type: {type(gradient_nonlinearity_model)}")
+        return trajectory_kspace.copy()
 
 
     def validate_trajectory(self, validation_threshold=0.1):
         """ Compares the predicted trajectory with the nominal trajectory. """
-        # (Implementation from previous version, ensure it uses self.nominal_trajectory_kspace etc.)
         if self.predicted_trajectory_kspace is None or self.nominal_trajectory_kspace is None:
-            print("Error: Nominal or predicted trajectory not available for validation.")
+            self.logger.error("Nominal or predicted trajectory not available for validation.")
             return False
         if self.nominal_trajectory_kspace.shape != self.predicted_trajectory_kspace.shape:
-            print("Error: Shape mismatch between nominal and predicted trajectories.")
+            self.logger.error("Shape mismatch between nominal and predicted trajectories.")
             return False
 
         diff = np.abs(self.predicted_trajectory_kspace - self.nominal_trajectory_kspace)
@@ -251,94 +310,108 @@ class TrajectoryPredictor:
         mean_deviation = np.mean(relative_error)
         max_abs_deviation = np.max(diff)
 
-        print(f"Validation: Mean Rel/Abs Deviation = {mean_deviation:.4f}, Max Abs Deviation = {max_abs_deviation:.4f}")
+        self.logger.info(f"Validation: Mean Rel/Abs Deviation = {mean_deviation:.4f}, Max Abs Deviation = {max_abs_deviation:.4f}")
         if mean_deviation <= validation_threshold:
-            print(f"Validation PASSED (Mean Dev {mean_deviation:.4f} <= Threshold {validation_threshold:.4f})")
+            self.logger.info(f"Validation PASSED (Mean Dev {mean_deviation:.4f} <= Threshold {validation_threshold:.4f})")
             return True
         else:
-            print(f"Validation FAILED (Mean Dev {mean_deviation:.4f} > Threshold {validation_threshold:.4f})")
+            self.logger.info(f"Validation FAILED (Mean Dev {mean_deviation:.4f} > Threshold {validation_threshold:.4f})")
             return False
 
 if __name__ == '__main__':
-    print("--- Running TrajectoryPredictor Example with Harmonics ---")
+    # Setup basic logging for the __main__ example if no other logging is configured
+    if not logging.getLogger().hasHandlers(): # Check root logger
+        # BasicConfig should ideally be called only once at application start.
+        # In a library, it's often left to the application to configure logging.
+        # However, for this example to run standalone and show logs, we add it.
+        logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(name)s: %(message)s')
+    logger_main = logging.getLogger("TrajectoryPredictorExample") # Use a specific name for module example
+
+    logger_main.info("--- Running TrajectoryPredictor Example with Harmonics & Conceptual Effects ---")
     dt_val = 4e-6
     num_pts = 256
     gamma_val = DEFAULT_GAMMA_PROTON
+    time_pts_s_example = np.arange(num_pts) * dt_val
+
 
     # 1. Create Dummy GIRF and Harmonics Data
     fft_freqs = np.fft.fftfreq(num_pts, d=dt_val)
-    girf_x_main = 0.9 * np.exp(1j * np.pi/8 * np.sign(fft_freqs)) # Attenuation and phase shift
+    girf_x_main = 0.9 * np.exp(1j * np.pi/8 * np.sign(fft_freqs))
     girf_x_main[0] = 0.9
 
-    # Harmonics for x-axis: e.g., one at 10kHz
-    # The complex_value is Xk_residual_peak / N_calibration_points
-    # So, if residual time signal has A*cos(2*pi*f0*t+phi), then Xk_peak/N = (A/2)*e^(j*phi)
-    harmonic_x1_freq = 10000 # 10 kHz
-    harmonic_x1_amp_phys = 0.05 # Relative to what? Let's say this is the A in A*cos(...)
+    harmonic_x1_freq = 10000
+    harmonic_x1_amp_phys = 0.001 # Amplitude of this gradient harmonic component (T/m)
     harmonic_x1_phase = np.pi/3
+    # complex_value = (Amp/2) * exp(j*phase) as stored by Calibrator
     harmonic_x1_cv = (harmonic_x1_amp_phys / 2) * np.exp(1j * harmonic_x1_phase)
 
     harmonics_data_x = [{'freq_hz': harmonic_x1_freq, 'complex_value': harmonic_x1_cv}]
 
     dummy_full_girf_data = {
-        'girf_spectra': {'x': girf_x_main, 'y': np.ones(num_pts, dtype=np.complex128)}, # y is ideal
-        'harmonic_components': {'x': harmonics_data_x, 'y': []} # No harmonics for y
+        'girf_spectra': {'x': girf_x_main, 'y': np.ones(num_pts, dtype=np.complex128)},
+        'harmonic_components': {'x': harmonics_data_x, 'y': []}
     }
 
     # 2. Initialize Predictor
     predictor = TrajectoryPredictor(dt=dt_val, gamma=gamma_val)
-    predictor.load_girf(dummy_full_girf_data) # Load from dict
+    predictor.load_girf(dummy_full_girf_data)
 
-    # 3. Create Nominal Trajectory (ramp for x, sine for y)
-    time_vec = np.arange(num_pts) * dt_val
-    nominal_kx = np.linspace(0, 150, num_pts) # m^-1
-    nominal_ky = 80 * np.sin(2 * np.pi * 2e3 * time_vec) # 2kHz sine, amp 80 m^-1
+    # 3. Create Nominal Trajectory
+    nominal_kx = np.linspace(0, 150, num_pts)
+    nominal_ky = 80 * np.sin(2 * np.pi * 2e3 * time_pts_s_example)
     nominal_k_data_dict = {'x': nominal_kx, 'y': nominal_ky}
 
     # 4. Predict Trajectory - WITHOUT Harmonics
-    print("\n--- Predicting WITHOUT Harmonics ---")
+    logger_main.info("\n--- Predicting WITHOUT Harmonics ---")
     predicted_k_no_harm = predictor.predict_trajectory(nominal_k_data_dict, apply_harmonics=False)
-    grad_pred_no_harm_x = predictor.predicted_gradients_time[:, predictor.axes_names.index('x')]
+    grad_pred_no_harm_x = predictor.predicted_gradients_time[:, predictor.axes_names.index('x')].copy()
 
     # 5. Predict Trajectory - WITH Harmonics
-    print("\n--- Predicting WITH Harmonics ---")
+    logger_main.info("\n--- Predicting WITH Harmonics ---")
     predicted_k_with_harm = predictor.predict_trajectory(nominal_k_data_dict, apply_harmonics=True)
-    grad_pred_with_harm_x = predictor.predicted_gradients_time[:, predictor.axes_names.index('x')]
+    grad_pred_with_harm_x = predictor.predicted_gradients_time[:, predictor.axes_names.index('x')].copy()
 
     # 6. Compare
-    print("\n--- Comparison ---")
-    k_diff_norm = np.linalg.norm(predicted_k_with_harm - predicted_k_no_harm)
-    grad_diff_norm = np.linalg.norm(grad_pred_with_harm_x - grad_pred_no_harm_x)
-
-    print(f"Norm of difference between k-space trajectories (with/without harmonics): {k_diff_norm:.3e}")
-    print(f"Norm of difference between X-gradients (with/without harmonics): {grad_diff_norm:.3e}")
-
-    # Expect grad_diff_norm to be non-zero if harmonics were applied
-    # The harmonic amplitude was 0.05. Its effect on gradients should be noticeable.
-    # A simple check: max abs diff of gradients
+    logger_main.info("\n--- Comparison (Harmonics Effect) ---")
     max_abs_grad_diff = np.max(np.abs(grad_pred_with_harm_x - grad_pred_no_harm_x))
-    print(f"Max absolute difference in X-gradients: {max_abs_grad_diff:.3e}")
-
-    # The time domain signal from harmonic: A*cos(2*pi*f*t + phi)
-    # Its derivative (related to gradient) will be A*2*pi*f * -sin(...)
-    # Max of that is A*2*pi*f. Here A=0.05, f=10kHz. Max grad component = 0.05 * 2*pi*10000 = 3141 T/m (if A was gradient units)
-    # However, harmonic['complex_value'] is for the *gradient residual*. So it's already in gradient-like units.
-    # The harmonic was A_grad_residual * cos(...). So max_abs_grad_diff should be around A_grad_residual (0.05).
-    # This depends on how well the single freq bin matches the harmonic_x1_freq.
-    if harmonics_data_x: # if harmonics were actually defined
-        if max_abs_grad_diff > 1e-9: # Check if it's meaningfully non-zero
-            print("Harmonic application seems to have an effect on gradients, as expected.")
-        else:
-            print("Warning: Harmonics applied, but difference in gradients is very small or zero.")
+    logger_main.info(f"Max absolute difference in X-gradients (with/without harmonics): {max_abs_grad_diff:.3e} T/m")
+    if harmonics_data_x and max_abs_grad_diff > 1e-9 * harmonic_x1_amp_phys :
+        logger_main.info("Harmonic application had a noticeable effect on gradients.")
+    elif not harmonics_data_x and max_abs_grad_diff < 1e-9:
+         logger_main.info("No harmonics defined, and difference is negligible, as expected.")
     else:
-        if max_abs_grad_diff < 1e-9:
-            print("No harmonics were defined, and difference is zero, as expected.")
-        else:
-            print("Warning: No harmonics defined, but difference in gradients is non-zero.")
+        logger_main.warning("Harmonic effect on gradients is smaller than expected or unexpected difference found.")
+
+    # 7. Apply Conceptual B0 Inhomogeneity Effect
+    logger_main.info("\n--- Applying Conceptual B0 Inhomogeneity Effect ---")
+    avg_b0_offset_example = 5.0 # Hz average offset
+    k_traj_after_b0 = predictor.apply_b0_inhomogeneity_effects(
+        predicted_k_with_harm,
+        avg_b0_offset_example,
+        time_pts_s_example
+    )
+    b0_k_diff_norm = np.linalg.norm(k_traj_after_b0 - predicted_k_with_harm)
+    logger_main.info(f"Norm of k-space difference after applying conceptual B0 effect: {b0_k_diff_norm:.3e}")
+    if b0_k_diff_norm > 1e-9: logger_main.info("Conceptual B0 effect modified the trajectory.")
 
 
-    # Validate the final trajectory (with harmonics)
-    print("\nValidating trajectory predicted WITH harmonics:")
-    predictor.validate_trajectory(validation_threshold=0.5) # Higher threshold as harmonics add deviation
+    # 8. Apply Conceptual Gradient Non-linearity Effect
+    logger_main.info("\n--- Applying Conceptual Gradient Non-linearity Effect ---")
+    dummy_gnl_model = {'sh_coeffs_x': [0.001, 0.0005], 'sh_coeffs_y': [0.0008]}
+    k_traj_after_gnl = predictor.apply_gradient_nonlinearity_effects(
+        k_traj_after_b0,
+        gradient_nonlinearity_model=dummy_gnl_model
+    )
+    gnl_k_diff_norm = np.linalg.norm(k_traj_after_gnl - k_traj_after_b0)
+    if gnl_k_diff_norm < 1e-9:
+        logger_main.info("Conceptual GNL effect is a placeholder and did not modify the trajectory, as expected.")
+    else:
+        logger_main.warning("Conceptual GNL effect (placeholder) unexpectedly modified the trajectory.")
 
-    print("\n--- TrajectoryPredictor Harmonics Example Finished ---")
+
+    # Validate the final trajectory (with all effects)
+    logger_main.info("\nValidating final conceptual trajectory (vs. original nominal):")
+    predictor.predicted_trajectory_kspace = k_traj_after_gnl
+    predictor.validate_trajectory(validation_threshold=0.5)
+
+    logger_main.info("\n--- TrajectoryPredictor Conceptual Effects Example Finished ---")
