@@ -9,6 +9,7 @@ from .planner import TrajectoryPlanner
 from .pns import PNSModel
 from .pipeline import girf_trajectory_pipeline
 from . import utils
+from . import harmonics
 
 __all__ = [
     "GIRFCalibrator",
@@ -18,5 +19,6 @@ __all__ = [
     "PNSModel",
     "girf_trajectory_pipeline",
     "utils",
+    "harmonics",
     "__version__",
 ]
