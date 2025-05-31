@@ -1,131 +1,137 @@
-# MRI K-Space Trajectory Generator (mritrajectory)
+# Trajgen: MRI K-Space Trajectory Generation Package
 
-## Description
+## Introduction
 
-`mritrajectory` is a Python library for generating and managing k-space trajectories for Magnetic Resonance Imaging (MRI). It provides tools to create various 2D and 3D trajectories, calculate their properties, and export them in different formats. This library is designed to be flexible for research and educational purposes in MRI pulse sequence development.
+`trajgen` is a Python package for generating, manipulating, and analyzing k-space trajectories used in Magnetic Resonance Imaging (MRI). It provides a flexible framework for researchers and developers working on pulse sequence design and image reconstruction.
 
-## Features
+The package allows users to:
+- Generate various 2D and 3D k-space trajectories.
+- Manage trajectory data, including k-space coordinates, gradient waveforms, and timing information.
+- Calculate trajectory-specific properties and performance metrics.
+- Apply simplified hardware constraints (maximum gradient, maximum slew rate).
+- Visualize trajectories and associated waveforms.
+- Perform basic image reconstruction using gridding techniques.
 
-*   **Versatile Trajectory Generation:**
-    *   **2D Trajectories:** Spiral, Radial, EPI (Echo Planar Imaging), Rosette.
-    *   **3D Trajectories:** Stack-of-Spirals, 3D Radial (Kooshball/Phyllotaxis-like), Cones, 3D EPI, ZTE (Zero Echo Time).
-    *   Generation of 3D trajectories by rotating 2D trajectories (e.g., spiral stack with golden angle).
-*   **Customizable Parameters:** Control FOV, resolution, gradient limits (Gmax, Smax), dwell time, number of interleaves, etc.
-*   **Advanced Spiral Features:**
-    *   Variable density spirals (power law, Gaussian, exponential, hybrid, custom).
-    *   Spiral-out-out trajectories.
-    *   Golden angle spirals.
-*   **UTE (Ultrashort Echo Time) Support:**
-    *   Ramp sampling for radial, cone, and ZTE trajectories (center-out half-spokes).
-*   **Trajectory Analysis and Metrics:**
-    *   Calculation of FOV, resolution.
-    *   Maximum gradient amplitude and slew rate.
-    *   Peripheral Nerve Stimulation (PNS) estimates (max abs gradient sum, max abs slew sum).
-    *   Voronoi cell size calculation for density compensation (2D and 3D).
-*   **Deadtime Handling:** Ability to specify and account for dead times at the beginning and end of the trajectory.
-*   **Flexible Gyromagnetic Ratio (Gamma):**
-    *   Easily specify gamma for different nuclei (e.g., 1H, 13C, 31P).
-    *   Includes a predefined dictionary `COMMON_NUCLEI_GAMMA_HZ_PER_T` for common nuclei.
-*   **Export/Import:** Save and load trajectories in `.npz`, `.csv`, `.npy`, or `.txt` formats.
-*   **Object-Oriented Design:**
-    *   `KSpaceTrajectoryGenerator`: Class for generating trajectory coordinates and gradient waveforms.
-    *   `Trajectory`: Class for holding trajectory data, metadata, and performing calculations.
+## Key Features
 
-## Installation / Setup
+*   **Trajectory Types Implemented:**
+    *   **2D:**
+        *   Spiral (uniform and variable density)
+        *   Radial
+        *   EPI (Echo Planar Imaging - flyback and gradient-recalled)
+        *   Rosette
+    *   **3D:**
+        *   Stack-of-Spirals (based on 2D spiral)
+        *   3D Radial (Kooshball-like, using golden angle distribution)
+        *   Cones (spirals on cone surfaces)
+*   **Customizable Parameters:** Control Field of View (FOV), resolution, dwell time (`dt_s`), gyromagnetic ratio (`gamma_Hz_per_T`), and trajectory-specific parameters (e.g., number of interleaves, spokes, petals, echoes).
+*   **Hardware Constraints:** Option to apply simplified maximum gradient and slew rate constraints.
+*   **Trajectory Analysis:**
+    *   Automatic calculation of FOV, resolution, max gradient, and max slew rate estimates.
+    *   Voronoi-based density compensation weight calculation (for 2D/3D).
+*   **Data Handling:**
+    *   `Trajectory` class to encapsulate k-space data, gradients, and metadata.
+    *   Export/import capabilities for common formats (NPZ, CSV, NPY, TXT).
+*   **Visualization:** Plotting utilities for k-space trajectories, gradient waveforms, and slew rates.
+*   **Image Reconstruction:** Basic gridding-based image reconstruction.
 
-Currently, the library consists of the main file `trajgen.py`. To use it, ensure this file is in your Python path or in the same directory as your script/notebook.
+## Installation
 
-Required Python packages:
-*   NumPy
-*   SciPy (for Voronoi calculations and some signal processing tools)
+To use this package, clone the repository and install the necessary dependencies:
 
-You can typically install these using pip:
 ```bash
+git clone https://github.com/your_username/trajgen.git # Replace with actual URL later
+cd trajgen
 pip install numpy scipy matplotlib
 ```
-(Note: `matplotlib` is useful for plotting examples from notebooks).
 
-## Quick Start
-
-Here's a basic example of generating a 2D spiral trajectory:
+## Basic Usage Example
 
 ```python
-from trajgen import KSpaceTrajectoryGenerator, Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
-import numpy as np
-import matplotlib.pyplot as plt
+from trajgen import KSpaceTrajectoryGenerator, COMMON_NUCLEI_GAMMA_HZ_PER_T
+from trajgen.utils import display_trajectory
+import matplotlib.pyplot as plt # For showing plots
 
-# 1. Initialize the trajectory generator
-gen_params = {
-    'fov': 0.22,  # meters
-    'resolution': 0.002,  # meters
-    'dt': 4e-6,  # seconds
-    'gamma': COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'], # Use proton gamma
-    'traj_type': 'spiral',
-    'dim': 2,
-    'n_interleaves': 16,
-    'turns': 2
+# 1. Initialize the trajectory generator for 2D trajectories
+gen_params_2d = {
+    'fov_mm': (220, 220),        # Field of View in mm
+    'resolution_mm': (2.0, 2.0), # Target resolution in mm
+    'num_dimensions': 2,
+    'dt_s': 4e-6,                # Dwell time: 4 microseconds
+    'gamma_Hz_per_T': COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'], # Gyromagnetic ratio for 1H
+    'max_grad_mT_per_m': 40.0,   # Optional: Max gradient strength
+    'max_slew_Tm_per_s_ms': 150.0 # Optional: Max slew rate
 }
-generator = KSpaceTrajectoryGenerator(**gen_params)
+generator_2d = KSpaceTrajectoryGenerator(**gen_params_2d)
 
-# 2. Generate k-space coordinates and gradients
-# Output shapes: (n_interleaves, n_samples_per_interleaf) for kx, ky, etc.
-# t is 1D array of time points for the full duration of one interleaf (after rewinders etc.)
-kx_per_interleaf, ky_per_interleaf, gx_per_interleaf, gy_per_interleaf, t_interleaf = generator.generate()
-
-# For a simple trajectory object, let's take the first interleaf
-k_points_single_interleaf = np.stack([kx_per_interleaf[0], ky_per_interleaf[0]]) # Shape (2, N_samples)
-# Or, to combine all interleaves into one Trajectory object:
-# k_points_all_interleaves = np.stack([kx_per_interleaf.ravel(), ky_per_interleaf.ravel()])
-# gradients_all_interleaves = np.stack([gx_per_interleaf.ravel(), gy_per_interleaf.ravel()])
-
-
-# 3. Create a Trajectory object
-# Gradients can be passed or computed automatically if dt and gamma are provided
-trajectory = Trajectory(
-    name="2D Spiral Example (Interleaf 0)",
-    kspace_points_rad_per_m=k_points_single_interleaf,
-    dt_seconds=generator.dt,
-    gamma_Hz_per_T=generator.gamma,
-    metadata={'generator_params': gen_params}
+# 2. Create a spiral trajectory
+spiral_traj = generator_2d.create_spiral(
+    num_interleaves=16,
+    points_per_interleaf=1024,
+    density_factor_at_center=2.0, # Example of variable density
+    density_transition_radius_factor=0.2,
+    apply_constraints=True
 )
+print("\\n--- Spiral Trajectory ---")
+spiral_traj.summary()
 
-# 4. Display trajectory summary
-trajectory.summary()
+# 3. Create an EPI trajectory
+epi_traj = generator_2d.create_epi_trajectory(
+    num_echoes=128,
+    points_per_echo=128,
+    epi_type='gradient_recalled',
+    phase_encode_direction='y',
+    apply_constraints=True
+)
+print("\\n--- EPI Trajectory ---")
+epi_traj.summary()
 
-# 5. Plot the first interleaf (optional)
-if k_points_single_interleaf.shape[1] > 0: # Check if there are points to plot
-    plt.figure()
-    plt.plot(k_points_single_interleaf[0, :], k_points_single_interleaf[1, :])
-    plt.title(f"K-space for {trajectory.name}")
-    plt.xlabel("Kx (rad/m)")
-    plt.ylabel("Ky (rad/m)")
-    plt.axis('equal')
-    plt.show()
+# 4. Initialize a generator for 3D trajectories
+gen_params_3d = {
+    'fov_mm': (200, 200, 100),
+    'resolution_mm': (2.0, 2.0, 2.0),
+    'num_dimensions': 3,
+    'dt_s': 4e-6,
+    'gamma_Hz_per_T': COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+}
+generator_3d = KSpaceTrajectoryGenerator(**gen_params_3d)
+
+# 5. Create a 3D Radial trajectory
+radial_3d_traj = generator_3d.create_radial(
+    num_spokes=2000,
+    points_per_spoke=128,
+    apply_constraints=False # Constraints not applied for this example
+)
+print("\\n--- 3D Radial Trajectory ---")
+radial_3d_traj.summary()
+
+# 6. Display a trajectory (e.g., the spiral)
+# Note: In a script, plt.show() would be needed.
+# In Jupyter, %matplotlib inline or %matplotlib widget handles display.
+# fig_spiral = display_trajectory(spiral_traj, show_gradients=True, show_slew=True)
+# plt.show()
+# fig_epi = display_trajectory(epi_traj)
+# plt.show()
+# fig_radial_3d = display_trajectory(radial_3d_traj)
+# plt.show()
+
+print("\\nBasic usage example finished.")
 ```
 
-## Detailed Examples
+## Running Tests
 
-For more detailed examples and advanced usage, please refer to the Jupyter Notebooks in the `examples/` directory:
+To run the unit tests for the `trajgen` package, navigate to the root directory of the repository and execute:
 
-*   `01_basic_2d_trajectories.ipynb`: Demonstrates spirals, radials, and 2D EPI.
-*   `02_basic_3d_trajectories.ipynb`: Covers stack-of-spirals, 3D radial, and 3D EPI.
-*   `03_ute_zte_trajectories.ipynb`: Shows UTE ramp sampling with radial/cone trajectories and ZTE.
-*   `04_trajectory_features.ipynb`: Illustrates deadtime handling, export/import, Voronoi density, and using predefined gyromagnetic ratios.
-*   `05_advanced_features.ipynb`: Contains examples of using `generate_3d_from_2d`, custom trajectory functions, and other advanced topics. (Note: Please verify the name and content of the fifth notebook as reported by the worker who created them).
+```bash
+python -m unittest discover -s tests -v
+```
 
-## Key Classes
+## Core Components
 
-*   **`KSpaceTrajectoryGenerator`**:
-    *   The primary class for designing and generating k-space trajectories.
-    *   Initialised with parameters like FOV, resolution, trajectory type, etc.
-    *   Its `generate()` method produces the k-space coordinates and gradient waveforms.
-    *   The `generate_3d_from_2d()` method allows creating complex 3D trajectories by rotating 2D bases.
-*   **`Trajectory`**:
-    *   A container class that holds the k-space points, time step (`dt_seconds`), and other relevant data for a generated trajectory.
-    *   Automatically calculates various metrics (FOV, resolution, max gradient, max slew, PNS estimates).
-    *   Can compute gradient waveforms if not provided.
-    *   Supports Voronoi density calculation via `calculate_voronoi_density()`.
-    *   Handles export to various file formats and import from `.npz`.
-    *   Provides a `summary()` method for quick inspection.
-*   **`COMMON_NUCLEI_GAMMA_HZ_PER_T`**:
-    *   A module-level dictionary providing gyromagnetic ratios (in Hz/T) for common MRI nuclei (e.g., '1H', '13C', '31P'). Useful for setting the `gamma` parameter in `KSpaceTrajectoryGenerator`.
+*   **`trajgen.KSpaceTrajectoryGenerator`**: A high-level class to configure and generate various trajectories.
+*   **`trajgen.Trajectory`**: Represents a k-space trajectory, holding its data and metadata, and offering methods for analysis and I/O.
+*   **`trajgen.generators`**: Module containing the underlying mathematical functions for generating specific trajectory shapes (e.g., `generate_spiral_trajectory`, `generate_radial_trajectory`).
+*   **`trajgen.utils`**: Module with utility functions for tasks like constraint application (`constrain_trajectory`), image reconstruction (`reconstruct_image`), and trajectory visualization (`display_trajectory`).
+*   **`trajgen.COMMON_NUCLEI_GAMMA_HZ_PER_T`**: A dictionary of gyromagnetic ratios for common nuclei.
+
+This structure allows for both high-level trajectory creation and access to lower-level generation and utility functions if needed.

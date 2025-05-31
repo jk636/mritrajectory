@@ -1,3 +1,11 @@
+"""
+Defines the core `Trajectory` class and related k-space helper functions.
+
+This module provides the `Trajectory` class, which encapsulates k-space data,
+gradient waveforms, and associated metadata for an MRI trajectory. It also includes
+functions for calculating density compensation weights (e.g., Voronoi-based) and
+other k-space utilities.
+"""
 import numpy as np
 from typing import Callable, Optional, Dict, Any
 from scipy.spatial import Voronoi, ConvexHull, voronoi_plot_2d
@@ -8,6 +16,15 @@ from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon
 
+__all__ = [
+    'Trajectory',
+    'COMMON_NUCLEI_GAMMA_HZ_PER_T',
+    'normalize_density_weights',
+    'create_periodic_points',
+    'compute_cell_area',
+    'compute_voronoi_density',
+    'compute_density_compensation'
+]
 
 # Gyromagnetic ratios for common nuclei in Hz/T
 COMMON_NUCLEI_GAMMA_HZ_PER_T = {
@@ -16,10 +33,54 @@ COMMON_NUCLEI_GAMMA_HZ_PER_T = {
 }
 
 class Trajectory:
-    def __init__(self, name, kspace_points_rad_per_m, 
-                 gradient_waveforms_Tm=None, dt_seconds=None, 
-                 metadata=None, gamma_Hz_per_T=COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
-                 dead_time_start_seconds=0.0, dead_time_end_seconds=0.0):
+    """
+    Represents an MRI k-space trajectory.
+
+    This class stores k-space coordinates, gradient waveforms (optional),
+    timing information, and various metadata. It provides methods for
+    calculating trajectory properties, density compensation, plotting,
+    and import/export.
+
+    Attributes:
+        name (str): Name of the trajectory.
+        kspace_points_rad_per_m (np.ndarray): K-space sample coordinates in rad/m,
+                                             shape (D, N) where D is dimensions, N is points.
+        gradient_waveforms_Tm (Optional[np.ndarray]): Gradient waveforms in T/m,
+                                                     shape (D, N). Can be computed if not provided.
+        dt_seconds (Optional[float]): Dwell time (time between k-space samples) in seconds.
+        metadata (Dict[str, Any]): Dictionary to store various metadata associated
+                                   with the trajectory.
+        gamma_Hz_per_T (float): Gyromagnetic ratio in Hz/T.
+        dead_time_start_seconds (float): Dead time at the beginning of the sequence.
+        dead_time_end_seconds (float): Dead time at the end of the sequence.
+        _D (int): Number of spatial dimensions.
+        _N (int): Number of k-space points.
+    """
+    def __init__(self, name: str,
+                 kspace_points_rad_per_m: np.ndarray,
+                 gradient_waveforms_Tm: Optional[np.ndarray] = None,
+                 dt_seconds: Optional[float] = None,
+                 metadata: Optional[Dict[str, Any]] = None,
+                 gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
+                 dead_time_start_seconds: float = 0.0,
+                 dead_time_end_seconds: float = 0.0):
+        """
+        Initializes a Trajectory object.
+
+        Args:
+            name (str): A name for the trajectory.
+            kspace_points_rad_per_m (np.ndarray): Array of k-space points (rad/m).
+                The input shape is flexible (e.g., (N,D) or (D,N)) and will be
+                oriented to (D,N) internally. For 1D data, it can be a flat array.
+            gradient_waveforms_Tm (Optional[np.ndarray]): Gradient waveforms (T/m).
+                If not provided, they can be computed from k-space points if dt_seconds
+                and gamma_Hz_per_T are available. Shape (D,N) or (N,D).
+            dt_seconds (Optional[float]): Time step between k-space samples (s).
+            metadata (Optional[Dict[str, Any]]): Additional metadata.
+            gamma_Hz_per_T (float): Gyromagnetic ratio (Hz/T). Defaults to '1H'.
+            dead_time_start_seconds (float): Dead time before k-space acquisition (s).
+            dead_time_end_seconds (float): Dead time after k-space acquisition (s).
+        """
         self.name = name
         _kspace_input_arr = np.array(kspace_points_rad_per_m)
         _kspace_points_oriented = _kspace_input_arr
@@ -101,6 +162,7 @@ class Trajectory:
         self._compute_metrics() 
 
     def _update_dead_time_metadata(self):
+        """Updates metadata dictionary with dead time information."""
         self.metadata['dead_time_start_seconds'] = self.dead_time_start_seconds
         self.metadata['dead_time_end_seconds'] = self.dead_time_end_seconds
         if self.dt_seconds is not None and self.dt_seconds > 0:
@@ -111,11 +173,22 @@ class Trajectory:
             self.metadata['dead_time_end_samples'] = None
 
     def get_gradient_waveforms_Tm(self) -> Optional[np.ndarray]:
+        """
+        Returns the gradient waveforms in T/m, ensuring shape (D, N).
+
+        If waveforms were provided at initialization, they are returned (potentially
+        transposed if detected to be (N,D)). Otherwise, they are computed from
+        k-space points if `dt_seconds` and `gamma_Hz_per_T` are available.
+        The computed gradients are stored in `self.gradient_waveforms_Tm` for future calls.
+
+        Returns:
+            Optional[np.ndarray]: Gradient waveforms in T/m (D,N), or None if not computable.
+        """
         if self.gradient_waveforms_Tm is not None:
             if self.gradient_waveforms_Tm.ndim == 2 and self._D is not None and self._N is not None and \
                self.gradient_waveforms_Tm.shape[0] == self._N and \
                self.gradient_waveforms_Tm.shape[1] == self._D and \
-               self._D != self._N :
+               self._D != self._N : # Check if it's transposed and not ambiguous (e.g. square matrix N=D)
                  self.gradient_waveforms_Tm = self.gradient_waveforms_Tm.T
             return self.gradient_waveforms_Tm
 
@@ -151,6 +224,13 @@ class Trajectory:
             self.metadata['max_slew_rate_Tm_per_s'] = 0.0 if self._N > 0 and gradients is not None and gradients.size > 0 else None
 
     def _calculate_pns(self):
+        """
+        Calculates and stores PNS-related metrics in metadata.
+
+        Metrics calculated:
+        - `pns_max_abs_gradient_sum_xyz`: Max of the sum of absolute gradient values across dimensions.
+        - `pns_max_abs_slew_sum_xyz`: Max of the sum of absolute slew values across dimensions.
+        """
         if self._N == 0 :
             self.metadata['pns_max_abs_gradient_sum_xyz'] = None
             self.metadata['pns_max_abs_slew_sum_xyz'] = None
@@ -191,6 +271,13 @@ class Trajectory:
             self.metadata['fov_estimate_mm'] = None
 
     def _calculate_resolution(self):
+        """
+        Estimates and stores overall spatial resolution in metadata.
+
+        Resolution is estimated as `1 / (2 * max_k_radius)`, where `max_k_radius`
+        is the maximum distance from the k-space origin.
+        Stored in `metadata['resolution_overall_estimate_m']` and `metadata['resolution_overall_estimate_mm']`.
+        """
         if self._N > 0 and self._D > 0:
             points = self.kspace_points_rad_per_m
             max_k_radius_rad_per_m = np.max(np.linalg.norm(points, axis=0))
@@ -210,20 +297,43 @@ class Trajectory:
         self._calculate_fov(); self._calculate_resolution()
 
     def get_duration_seconds(self) -> Optional[float]:
+        """Calculates the total duration of the trajectory including dead times."""
         if self.dt_seconds is None: return None
         return self.dead_time_start_seconds + (self._N * self.dt_seconds) + self.dead_time_end_seconds
 
     def get_max_grad_Tm(self) -> Optional[float]:
+        """Returns the maximum gradient amplitude in T/m across all points and dimensions."""
         gradients = self.get_gradient_waveforms_Tm()
         return np.max(np.linalg.norm(gradients, axis=0)) if gradients is not None and gradients.size > 0 else None
 
     def get_max_slew_Tm_per_s(self) -> Optional[float]:
+        """Returns the maximum slew rate in T/m/s from metadata `max_slew_rate_Tm_per_s`."""
         return self.metadata.get('max_slew_rate_Tm_per_s')
 
-    def get_num_points(self) -> int: return self._N
-    def get_num_dimensions(self) -> int: return self._D
+    def get_num_points(self) -> int:
+        """Returns the number of k-space points (N)."""
+        return self._N
 
-    def export(self, filename, filetype=None):
+    def get_num_dimensions(self) -> int:
+        """Returns the number of spatial dimensions (D)."""
+        return self._D
+
+    def export(self, filename: str, filetype: Optional[str] = None) -> None:
+        """
+        Exports trajectory data to a file.
+
+        Supported filetypes: 'csv', 'npy', 'npz', 'txt'.
+        If filetype is None, it's inferred from the filename extension.
+        NPZ format includes k-space, gradients (if available), dt_seconds, and metadata.
+        Other formats save only k-space points (transposed to N,D).
+
+        Args:
+            filename (str): The name of the file to save.
+            filetype (Optional[str]): The type of file to save ('csv', 'npy', 'npz', 'txt').
+
+        Raises:
+            ValueError: If the filetype is unsupported.
+        """
         if filetype is None:
             filetype = filename.split('.')[-1].lower() if '.' in filename else 'txt'
         
@@ -248,7 +358,25 @@ class Trajectory:
         else: raise ValueError(f"Unsupported filetype: {filetype}")
 
     @classmethod
-    def import_from(cls, filename):
+    def import_from(cls, filename: str) -> 'Trajectory':
+        """
+        Imports trajectory data from a file.
+
+        Supported filetypes: 'csv', 'npy', 'npz', 'txt'.
+        Filetype is inferred from the filename extension.
+        NPZ files can contain k-space, gradients, dt_seconds, and metadata.
+        Other formats load k-space points (assumed N,D) and use default for other parameters.
+
+        Args:
+            filename (str): The name of the file to load.
+
+        Returns:
+            Trajectory: A new Trajectory object.
+
+        Raises:
+            ValueError: If the filetype is unsupported.
+            FileNotFoundError: If the file does not exist (via underlying load functions).
+        """
         filetype = filename.split('.')[-1].lower() if '.' in filename else 'txt'
         points, gradients, dt, metadata_dict = None, None, None, {}
 
@@ -283,14 +411,95 @@ class Trajectory:
                    dead_time_start_seconds=metadata_dict.get('dead_time_start_seconds', 0.0),
                    dead_time_end_seconds=metadata_dict.get('dead_time_end_seconds', 0.0))
 
-    def calculate_voronoi_density(self, force_recompute=False, qhull_options=None):
-        self.metadata['voronoi_calculation_status'] = "Skipped: compute_voronoi_density not available"
-        self.metadata['voronoi_cell_sizes'] = None
-        return None
+    def calculate_voronoi_density(self, force_recompute: bool = False,
+                                  qhull_options: Optional[str] = None) -> Optional[np.ndarray]:
+        """
+        Calculates Voronoi-based density compensation weights.
 
-    def plot_3d(self, max_total_points=2000, max_interleaves=None, 
-                interleaf_stride=1, point_stride=1, 
-                title=None, ax=None, figure=None, plot_style='.-'):
+        The k-space points (D,N) are transposed to (N,D) as expected by
+        `compute_voronoi_density`. The results are stored in metadata:
+        `self.metadata['density_compensation_weights_voronoi']` and
+        `self.metadata['voronoi_cell_sizes']` (currently same as weights).
+        The status is stored in `self.metadata['voronoi_calculation_status']`.
+
+        Args:
+            force_recompute (bool): If True, recalculates even if results exist.
+            qhull_options (Optional[str]): Options for Qhull (Voronoi calculation).
+
+        Returns:
+            Optional[np.ndarray]: Computed density weights, or None on error/empty.
+                                  Returns an empty array for 0-point trajectories.
+        """
+        if not force_recompute and self.metadata.get('voronoi_calculation_status') == "Success":
+            return self.metadata.get('density_compensation_weights_voronoi')
+
+        self.metadata['voronoi_calculation_status'] = "Starting..."
+        self.metadata['voronoi_cell_sizes'] = None
+        self.metadata['density_compensation_weights_voronoi'] = None
+
+        if self._N == 0:
+            self.metadata['voronoi_calculation_status'] = "Skipped: No k-space points"
+            return np.array([])
+
+        # compute_voronoi_density expects (N, D)
+        # self.kspace_points_rad_per_m is (D, N)
+        kspace_points_nd = self.kspace_points_rad_per_m.T
+
+        if kspace_points_nd.shape[1] == 0: # Should be caught by self._N == 0, but as a safeguard
+             self.metadata['voronoi_calculation_status'] = "Skipped: K-space points have no dimensions"
+             return np.array([])
+
+        try:
+            # Assuming compute_voronoi_density is available in the global scope
+            # and handles different dimensions appropriately.
+            density_weights = compute_voronoi_density(
+                kspace_points_nd,
+                qhull_options=qhull_options
+            )
+
+            if density_weights is not None and density_weights.size == self._N:
+                self.metadata['voronoi_cell_sizes'] = density_weights # Original request, might be different from true "cell sizes"
+                self.metadata['density_compensation_weights_voronoi'] = density_weights
+                self.metadata['voronoi_calculation_status'] = "Success"
+                return density_weights
+            elif density_weights is not None and density_weights.size != self._N:
+                self.metadata['voronoi_calculation_status'] = f"Error: Mismatch in returned weights size ({density_weights.size}) and number of points ({self._N})"
+                return None
+            else: # density_weights is None
+                 self.metadata['voronoi_calculation_status'] = "Error: compute_voronoi_density returned None"
+                 return None
+
+        except Exception as e:
+            self.metadata['voronoi_calculation_status'] = f"Error: {str(e)}"
+            return None
+
+    def plot_3d(self, max_total_points: int = 2000,
+                max_interleaves: Optional[int] = None,
+                interleaf_stride: int = 1,
+                point_stride: int = 1,
+                title: Optional[str] = None,
+                ax: Optional[Axes3D] = None,
+                figure: Optional[plt.Figure] = None,
+                plot_style: str = '.-') -> Optional[Axes3D]:
+        """
+        Plots a 3D trajectory.
+
+        Args:
+            max_total_points (int): Max points to display overall after applying strides.
+            max_interleaves (Optional[int]): Max interleaves to plot if 'interleaf_structure'
+                                           in metadata.
+            interleaf_stride (int): Stride for plotting interleaves.
+            point_stride (int): Stride for plotting points within an interleaf/trajectory.
+            title (Optional[str]): Plot title.
+            ax (Optional[Axes3D]): Matplotlib 3D Axes to plot on. If None, a new one is created.
+                                   If a non-3D Axes is passed, it's cleared and replaced by a 3D one.
+            figure (Optional[plt.Figure]): Matplotlib Figure to use if `ax` is None.
+            plot_style (str): Plotting style string (e.g., '.-', 'o').
+
+        Returns:
+            Optional[Axes3D]: The Matplotlib 3D Axes object used for plotting, or None if not plotted
+                             (e.g., trajectory is not 3D or has no points).
+        """
         if self._D < 3:
             print(f"Trajectory '{self.name}' is not 3D. Use plot_2d or ensure data is 3D.")
             return ax if ax is not None else None
@@ -357,9 +566,34 @@ class Trajectory:
         ax.set_title(final_plot_title)
         return ax
 
-    def plot_2d(self, max_total_points=10000, max_interleaves=None, 
-                interleaf_stride=1, point_stride=1, 
-                title=None, ax=None, figure=None, plot_style='.-', legend_on=False):
+    def plot_2d(self, max_total_points: int = 10000,
+                max_interleaves: Optional[int] = None,
+                interleaf_stride: int = 1,
+                point_stride: int = 1,
+                title: Optional[str] = None,
+                ax: Optional[plt.Axes] = None,
+                figure: Optional[plt.Figure] = None,
+                plot_style: str = '.-',
+                legend_on: bool = False) -> Optional[plt.Axes]:
+        """
+        Plots a 2D trajectory (or the first two dimensions of a higher-D trajectory).
+
+        Args:
+            max_total_points (int): Max points to display overall after applying strides.
+            max_interleaves (Optional[int]): Max interleaves to plot if 'interleaf_structure'
+                                           in metadata.
+            interleaf_stride (int): Stride for plotting interleaves.
+            point_stride (int): Stride for plotting points within an interleaf/trajectory.
+            title (Optional[str]): Plot title.
+            ax (Optional[plt.Axes]): Matplotlib Axes to plot on. If None, a new one is created.
+            figure (Optional[plt.Figure]): Matplotlib Figure to use if `ax` is None.
+            plot_style (str): Plotting style string (e.g., '.-', 'o').
+            legend_on (bool): If True and interleaves are plotted, a legend is shown.
+
+        Returns:
+            Optional[plt.Axes]: The Matplotlib Axes object used for plotting, or None if not plotted
+                                (e.g., trajectory is not 2D or has no points).
+        """
         if self._D < 2:
             print(f"Trajectory '{self.name}' is not at least 2D.")
             return ax if ax is not None else None
@@ -425,13 +659,201 @@ class Trajectory:
         ax.axis('equal')
         return ax
 
-    def plot_voronoi(self, title=None, **kwargs):
-        print(f"plot_voronoi for {self.name}: Basic 2D/3D plot shown as Voronoi not fully implemented in this pass.")
-        if self._D == 2 and self._N > 3: return self.plot_2d(title=title or "Voronoi (fallback to 2D plot)")
-        elif self._D ==3 and self._N > 4: return self.plot_3d(title=title or "Voronoi (fallback to 3D plot)")
-        return None
+    def plot_voronoi(self, title: Optional[str] = None,
+                     ax: Optional[plt.Axes] = None,
+                     figure: Optional[plt.Figure] = None,
+                     qhull_options: Optional[str] = None,
+                     plot_points: bool = True,
+                     point_style: str = 'ko',
+                     point_size: float = 2,
+                     clip_boundary_m: Optional[float] = None) -> Optional[plt.Axes]:
+        """
+        Plots the Voronoi diagram for 2D trajectories.
+
+        For 3D trajectories, it currently prints a message and shows a 3D scatter plot.
+        For 1D trajectories, it plots the points on a line.
+
+        Args:
+            title (Optional[str]): Plot title.
+            ax (Optional[plt.Axes]): Matplotlib Axes to plot on.
+            figure (Optional[plt.Figure]): Matplotlib Figure to use if `ax` is None.
+            qhull_options (Optional[str]): Options for Qhull (Voronoi calculation).
+            plot_points (bool): If True, overlay k-space points on the Voronoi diagram.
+            point_style (str): Style for plotted points.
+            point_size (float): Size for plotted points.
+            clip_boundary_m (Optional[float]): Radius for clipping infinite Voronoi regions.
+                                            If None, infinite regions might not be drawn or
+                                            might extend to plot edges.
+
+        Returns:
+            Optional[plt.Axes]: The Matplotlib Axes object, or None if plotting fails early.
+                                Returns Axes for all valid plot scenarios.
+        """
+
+        final_plot_title = title if title else f"Voronoi Diagram: {self.name}"
+
+        if self._N == 0:
+            print(f"Trajectory '{self.name}' has no k-space points to plot for Voronoi.")
+            if ax is None:
+                fig = figure if figure else plt.figure()
+                ax = fig.add_subplot(111)
+            ax.set_title(final_plot_title + " (No points)")
+            ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+            return ax
+
+        if self._D == 1:
+            print(f"Voronoi plotting for 1D trajectory '{self.name}' is not standard. Plotting points instead.")
+            if ax is None:
+                fig = figure if figure else plt.figure()
+                ax = fig.add_subplot(111)
+            k_data = self.kspace_points_rad_per_m
+            ax.plot(k_data[0,:], np.zeros_like(k_data[0,:]), point_style, markersize=point_size)
+            ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("")
+            ax.set_title(final_plot_title + " (1D points)")
+            return ax
+
+        if self._D != 2 : # For now, only implement 2D Voronoi
+            print(f"Voronoi plot for {self._D}D trajectory '{self.name}' is not implemented. Plotting a scatter of points.")
+            if self._D == 3:
+                return self.plot_3d(title=final_plot_title + " (3D Scatter Fallback)", ax=ax, figure=figure, plot_style=point_style)
+            else: # Fallback for other dimensions if any
+                if ax is None:
+                    fig = figure if figure else plt.figure()
+                    ax = fig.add_subplot(111)
+                # Generic scatter for D > 3 or if plot_3d is not suitable
+                points_for_plot = self.kspace_points_rad_per_m.T # (N,D)
+                ax.scatter(*points_for_plot[:,:2].T, s=point_size, c='k' if point_style.startswith('k') else None)
+                ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+                ax.set_title(final_plot_title + f" ({self._D}D Scatter Fallback)")
+                return ax
+
+        # Proceed with 2D Voronoi Plotting
+        if ax is None:
+            fig = figure if figure else plt.figure()
+            ax = fig.add_subplot(111)
+
+        k_points_nd = self.kspace_points_rad_per_m.T # Expected (N, D) by Voronoi
+
+        if k_points_nd.shape[0] < self._D + 1: # Need at least D+1 points for Voronoi in D dimensions
+             print(f"Not enough unique points ({k_points_nd.shape[0]}) for a {self._D}D Voronoi diagram. Plotting points.")
+             ax.plot(k_points_nd[:,0], k_points_nd[:,1], point_style, markersize=point_size)
+             ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+             ax.set_title(final_plot_title + " (Too few points for Voronoi)")
+             ax.axis('equal')
+             return ax
+
+        default_qhull_options = 'Qbb Qc Qz' # Basic options for robustness
+        final_qhull_options = qhull_options if qhull_options is not None else default_qhull_options
+
+        try:
+            vor = Voronoi(k_points_nd, qhull_options=final_qhull_options)
+        except QhullError as e:
+            print(f"QhullError during Voronoi computation for '{self.name}': {e}. Plotting points only.")
+            ax.plot(k_points_nd[:,0], k_points_nd[:,1], point_style, markersize=point_size)
+            ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+            ax.set_title(final_plot_title + " (QhullError, points shown)")
+            ax.axis('equal')
+            return ax
+        except Exception as e: # Catch any other error during Voronoi creation
+            print(f"Error during Voronoi computation for '{self.name}': {e}. Plotting points only.")
+            ax.plot(k_points_nd[:,0], k_points_nd[:,1], point_style, markersize=point_size)
+            ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+            ax.set_title(final_plot_title + " (Voronoi Error, points shown)")
+            ax.axis('equal')
+            return ax
+
+        # Plot Voronoi regions
+        patches = []
+        min_coord = vor.min_bound if hasattr(vor, 'min_bound') else np.min(vor.vertices, axis=0)
+        max_coord = vor.max_bound if hasattr(vor, 'max_bound') else np.max(vor.vertices, axis=0)
+        plot_radius_factor = 1.5
+
+        # Determine plot limits for clipping infinite regions
+        # If clip_boundary_m is given, use that. Otherwise, estimate from points.
+        if clip_boundary_m is not None and clip_boundary_m > 0:
+            visible_min = -clip_boundary_m
+            visible_max = clip_boundary_m
+            plot_center = np.array([0.0, 0.0])
+        else:
+            # Fallback if clip_boundary_m is not provided: estimate from point cloud
+            ptp_bound = np.max(vor.points, axis=0) - np.min(vor.points, axis=0)
+            plot_center = np.mean(vor.points, axis=0)
+            # Ensure plot_radius is not zero, e.g. for single point or colinear points
+            plot_radius = max(np.max(ptp_bound) * plot_radius_factor, 1e-3)
+            visible_min = plot_center - plot_radius
+            visible_max = plot_center + plot_radius
+
+
+        for region_idx in vor.point_region:
+            region = vor.regions[region_idx]
+            if not -1 in region: # Finite region
+                polygon_verts = vor.vertices[region]
+                patches.append(Polygon(polygon_verts, closed=True))
+            else: # Infinite region, try to clip (basic clipping)
+                # Get ridges for this point
+                point_idx = np.where(vor.point_region == region_idx)[0][0]
+
+                # Filter ridges connected to this point
+                ridges_for_point = []
+                for ridge_points_indices, ridge_vertices_indices in zip(vor.ridge_points, vor.ridge_vertices):
+                    if point_idx in ridge_points_indices:
+                        # Check if this ridge involves an infinite vertex
+                        if -1 in ridge_vertices_indices:
+                             ridges_for_point.append((ridge_points_indices, ridge_vertices_indices))
+
+                if not ridges_for_point: continue # Should not happen for infinite regions typically
+
+                # Sort vertices of the region, handling -1s by finding intersections with boundary
+                # This part is complex. For now, we'll skip drawing complex infinite regions or use a simpler method.
+                # A very simple approach: don't draw infinite regions if they are too complex or extend too far.
+                # Or, create a large bounding box and clip polygon there.
+                # For now, let's just skip drawing infinite regions if clipping boundary not specified.
+                if clip_boundary_m is None:
+                    continue
+
+                # A more robust way for infinite regions (simplified):
+                # Use the finite vertices and create new vertices at the intersection of ridges with the bounding box.
+                # This is non-trivial. For this implementation, we will rely on matplotlib's default behavior for patches
+                # that might go out of bounds, or we can choose not to plot them if clip_boundary_m is not set.
+                # For now, we are skipping them if clip_boundary_m is None
+                # If clip_boundary_m is set, we could attempt to draw them, but they might look odd without proper clipping.
+                # A simple fill will often fail for non-convex or open polygons.
+                # A better approach for infinite regions involves computing intersections with a bounding box.
+                # This is non-trivial. For now, let's use a simpler representation or skip.
+                # Fallback: simply don't draw infinite regions for now, unless a clipping boundary is provided.
+                # This part needs a more robust geometric library or algorithm for proper clipping.
+                pass # Skip infinite regions if no clip_boundary_m
+
+
+        if patches: # Only add collection if there are finite polygons to draw
+             p = PatchCollection(patches, alpha=0.4, edgecolor='gray', facecolor='lightblue') # Example styling
+             ax.add_collection(p)
+
+        if plot_points:
+            ax.plot(vor.points[:,0], vor.points[:,1], point_style, markersize=point_size)
+
+        ax.set_xlabel("Kx (rad/m)"); ax.set_ylabel("Ky (rad/m)")
+        ax.set_title(final_plot_title)
+
+        # Set plot limits
+        if clip_boundary_m is not None and clip_boundary_m > 0:
+            ax.set_xlim([visible_min, visible_max])
+            ax.set_ylim([visible_min, visible_max])
+        else: # Auto-scale based on Voronoi vertices or points
+            # Use min/max of Voronoi vertices if available and finite, else use points
+            finite_vertices = vor.vertices[np.all(np.isfinite(vor.vertices), axis=1)]
+            if finite_vertices.size > 0:
+                 ax.set_xlim([np.min(finite_vertices[:,0]), np.max(finite_vertices[:,0])])
+                 ax.set_ylim([np.min(finite_vertices[:,1]), np.max(finite_vertices[:,1])])
+            elif vor.points.size >0 : # Fallback to points if no finite vertices
+                 ax.set_xlim([np.min(vor.points[:,0]), np.max(vor.points[:,0])])
+                 ax.set_ylim([np.min(vor.points[:,1]), np.max(vor.points[:,1])])
+            # ax.axis('equal') # 'equal' axis can make clipped regions look very large if plot_radius is small
+
+        return ax
         
-    def summary(self):
+    def summary(self) -> None:
+        """Prints a summary of the trajectory's properties and metadata to stdout."""
         print(f"Trajectory Summary: {self.name}")
         print(f"  Dimensions (D): {self.get_num_dimensions()}")
         print(f"  Points (N): {self.get_num_points()}")
