@@ -8,8 +8,230 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from trajgen.trajectory import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
-from trajgen.generators import generate_radial_trajectory, generate_spiral_trajectory
-from trajgen.utils import constrain_trajectory, reconstruct_image, display_trajectory
+from trajgen.generators import generate_radial_trajectory, generate_spiral_trajectory # Keep if TestConstrain uses it
+from trajgen.utils import (
+    constrain_trajectory, reconstruct_image, display_trajectory,
+    stack_2d_trajectory_to_3d, rotate_3d_trajectory
+)
+from trajgen.sequences.radial import RadialSequence
+from trajgen.sequences.tpi import TwistedProjectionImagingSequence # For creating a 3D trajectory
+
+
+class TestRotate3DTrajectory(unittest.TestCase):
+    def setUp(self):
+        self.params_3d_tpi = {
+            'name': "TestTPI_for_rotation",
+            'fov_mm': 200.0,
+            'resolution_mm': 5.0, # Coarser for speed
+            'dt_seconds': 4e-6,
+            'num_twists': 8, # Fewer twists
+            'points_per_segment': 64, # Fewer points
+            'cone_angle_deg': 30.0,
+            'spiral_turns_per_twist': 2.0,
+        }
+        self.traj_3d = TwistedProjectionImagingSequence(**self.params_3d_tpi)
+
+        # For testing invalid dimension input
+        self.params_2d_radial = {
+            'name': "TestRadial2D_for_rot_fail",
+            'fov_mm': 200.0, 'resolution_mm': 4.0, 'num_dimensions': 2,
+            'dt_seconds': 4e-6, 'num_spokes': 16, 'points_per_spoke': 64,
+        }
+        self.traj_2d = RadialSequence(**self.params_2d_radial)
+
+
+    def test_rotation_with_matrix(self):
+        # 90-degree rotation around z-axis: kx_new = -ky_old, ky_new = kx_old, kz_new = kz_old
+        Rz_90 = np.array([
+            [0, -1, 0],
+            [1,  0, 0],
+            [0,  0, 1]
+        ])
+        rotated_traj = rotate_3d_trajectory(self.traj_3d, rotation_matrix=Rz_90)
+
+        self.assertIsInstance(rotated_traj, Trajectory)
+        self.assertEqual(rotated_traj.get_num_dimensions(), 3)
+        self.assertEqual(rotated_traj.get_num_points(), self.traj_3d.get_num_points())
+        self.assertEqual(rotated_traj.name, "rotated_" + self.traj_3d.name)
+
+        original_k = self.traj_3d.kspace_points_rad_per_m
+        rotated_k = rotated_traj.kspace_points_rad_per_m
+
+        np.testing.assert_array_almost_equal(rotated_k[0, :], -original_k[1, :]) # new kx = -old ky
+        np.testing.assert_array_almost_equal(rotated_k[1, :],  original_k[0, :]) # new ky =  old kx
+        np.testing.assert_array_almost_equal(rotated_k[2, :],  original_k[2, :]) # new kz =  old kz
+        self.assertTrue(rotated_traj.metadata.get('rotation_applied'))
+        self.assertIn('rotation_matrix', rotated_traj.metadata.get('rotation_details', {}))
+
+
+    def test_rotation_with_euler_angles(self):
+        # Euler angles for 90-degree rotation around Z-axis (alpha=90, beta=0, gamma=0 for ZYX)
+        euler_angles = (90.0, 0.0, 0.0)
+        rotated_traj = rotate_3d_trajectory(self.traj_3d, euler_angles_deg=euler_angles)
+
+        self.assertIsInstance(rotated_traj, Trajectory)
+        self.assertEqual(rotated_traj.get_num_dimensions(), 3)
+
+        original_k = self.traj_3d.kspace_points_rad_per_m
+        rotated_k = rotated_traj.kspace_points_rad_per_m
+
+        # Expected: kx_new = -ky_old, ky_new = kx_old, kz_new = kz_old for Z-rot by 90 deg
+        np.testing.assert_array_almost_equal(rotated_k[0, :], -original_k[1, :], decimal=5)
+        np.testing.assert_array_almost_equal(rotated_k[1, :],  original_k[0, :], decimal=5)
+        np.testing.assert_array_almost_equal(rotated_k[2, :],  original_k[2, :], decimal=5)
+        self.assertTrue(rotated_traj.metadata.get('rotation_applied'))
+        self.assertEqual(rotated_traj.metadata.get('rotation_details', {}).get('euler_angles_deg_ZYX'), euler_angles)
+
+        # Test a more complex rotation: 90 deg around Y (beta=90)
+        # kx_new = kz_old, ky_new = ky_old, kz_new = -kx_old
+        euler_angles_y90 = (0.0, 90.0, 0.0)
+        rotated_traj_y90 = rotate_3d_trajectory(self.traj_3d, euler_angles_deg=euler_angles_y90)
+        rotated_k_y90 = rotated_traj_y90.kspace_points_rad_per_m
+        np.testing.assert_array_almost_equal(rotated_k_y90[0,:], original_k[2,:], decimal=5) # kx_new = kz_old
+        np.testing.assert_array_almost_equal(rotated_k_y90[1,:], original_k[1,:], decimal=5) # ky_new = ky_old
+        np.testing.assert_array_almost_equal(rotated_k_y90[2,:], -original_k[0,:], decimal=5) # kz_new = -kx_old
+
+
+    def test_invalid_input_dimension(self):
+        with self.assertRaisesRegex(ValueError, "Input trajectory must be 3-dimensional."):
+            rotate_3d_trajectory(self.traj_2d, euler_angles_deg=(90,0,0))
+
+    def test_invalid_rotation_input(self):
+        Rz_90 = np.array([[0,-1,0],[1,0,0],[0,0,1]])
+        euler_angles = (90.0, 0.0, 0.0)
+
+        with self.assertRaisesRegex(ValueError, "Provide either rotation_matrix or euler_angles_deg, not both."):
+            rotate_3d_trajectory(self.traj_3d, rotation_matrix=Rz_90, euler_angles_deg=euler_angles)
+
+        with self.assertRaisesRegex(ValueError, "Either rotation_matrix or euler_angles_deg must be provided."):
+            rotate_3d_trajectory(self.traj_3d)
+
+        invalid_matrix = np.array([[1,0],[0,1]]) # 2x2 matrix
+        with self.assertRaisesRegex(ValueError, "rotation_matrix must be a 3x3 NumPy array."):
+            rotate_3d_trajectory(self.traj_3d, rotation_matrix=invalid_matrix)
+
+
+class TestStack2DTo3D(unittest.TestCase):
+    def setUp(self):
+        # Create a simple 2D RadialSequence for testing
+        self.params_2d = {
+            'name': "TestRadial2D_for_stacking",
+            'fov_mm': 200.0,
+            'resolution_mm': 4.0, # Coarser resolution for fewer points -> faster tests
+            'num_dimensions': 2,
+            'dt_seconds': 4e-6,
+            'num_spokes': 16, # Fewer spokes
+            'points_per_spoke': 64, # Fewer points
+            'projection_angle_increment': 'golden_angle',
+        }
+        self.traj_2d = RadialSequence(**self.params_2d)
+
+        self.params_3d_ref = { # For creating a 3D trajectory to test invalid input
+            'name': "TestRadial3D_ref",
+            'fov_mm': 200.0,
+            'resolution_mm': 4.0,
+            'num_dimensions': 3,
+            'dt_seconds': 4e-6,
+            'num_spokes': 16,
+            'points_per_spoke': 64,
+        }
+        self.traj_3d_ref = RadialSequence(**self.params_3d_ref)
+
+
+    def test_stacking_basic(self):
+        num_slices = 5
+        slice_separation_rad_per_m = 100.0 # Example: 0.1 rad/mm = 100 rad/m
+
+        stacked_traj = stack_2d_trajectory_to_3d(
+            self.traj_2d,
+            num_slices=num_slices,
+            slice_separation_rad_per_m=slice_separation_rad_per_m
+        )
+
+        self.assertIsInstance(stacked_traj, Trajectory)
+        self.assertEqual(stacked_traj.get_num_dimensions(), 3)
+        self.assertEqual(stacked_traj.get_num_points(), num_slices * self.traj_2d.get_num_points())
+        self.assertEqual(stacked_traj.name, "stacked_" + self.traj_2d.name)
+
+        # Check kz offsets
+        points_per_2d_traj = self.traj_2d.get_num_points()
+        expected_kz_offsets = np.linspace(
+            -(num_slices - 1) / 2.0 * slice_separation_rad_per_m,
+            (num_slices - 1) / 2.0 * slice_separation_rad_per_m,
+            num_slices
+        )
+        for i in range(num_slices):
+            kz_vals_slice = stacked_traj.kspace_points_rad_per_m[2, i*points_per_2d_traj:(i+1)*points_per_2d_traj]
+            self.assertTrue(np.allclose(kz_vals_slice, expected_kz_offsets[i]))
+            # Check that kx/ky are copied correctly for the first slice (no rotation)
+            if i == 0:
+                 np.testing.assert_array_almost_equal(
+                     stacked_traj.kspace_points_rad_per_m[0:2, 0:points_per_2d_traj],
+                     self.traj_2d.kspace_points_rad_per_m
+                 )
+
+    def test_stacking_with_rotation(self):
+        num_slices = 3
+        slice_separation_rad_per_m = 50.0
+        rotation_angles_deg = [0.0, 45.0, 90.0]
+
+        stacked_traj = stack_2d_trajectory_to_3d(
+            self.traj_2d,
+            num_slices=num_slices,
+            slice_separation_rad_per_m=slice_separation_rad_per_m,
+            rotation_angles_deg=rotation_angles_deg
+        )
+
+        self.assertEqual(stacked_traj.get_num_dimensions(), 3)
+        self.assertEqual(stacked_traj.get_num_points(), num_slices * self.traj_2d.get_num_points())
+
+        points_per_2d_traj = self.traj_2d.get_num_points()
+        original_kx = self.traj_2d.kspace_points_rad_per_m[0, :]
+        original_ky = self.traj_2d.kspace_points_rad_per_m[1, :]
+
+        # Slice 0 (0 deg rotation)
+        kx_slice0 = stacked_traj.kspace_points_rad_per_m[0, 0:points_per_2d_traj]
+        ky_slice0 = stacked_traj.kspace_points_rad_per_m[1, 0:points_per_2d_traj]
+        np.testing.assert_array_almost_equal(kx_slice0, original_kx)
+        np.testing.assert_array_almost_equal(ky_slice0, original_ky)
+
+        # Slice 1 (45 deg rotation)
+        angle_rad_45 = np.deg2rad(45.0)
+        cos_45, sin_45 = np.cos(angle_rad_45), np.sin(angle_rad_45)
+        expected_kx_slice1 = original_kx * cos_45 - original_ky * sin_45
+        expected_ky_slice1 = original_kx * sin_45 + original_ky * cos_45
+        kx_slice1 = stacked_traj.kspace_points_rad_per_m[0, points_per_2d_traj:2*points_per_2d_traj]
+        ky_slice1 = stacked_traj.kspace_points_rad_per_m[1, points_per_2d_traj:2*points_per_2d_traj]
+        np.testing.assert_array_almost_equal(kx_slice1, expected_kx_slice1)
+        np.testing.assert_array_almost_equal(ky_slice1, expected_ky_slice1)
+
+        # Slice 2 (90 deg rotation)
+        # For 90 deg: kx_new = -ky_orig, ky_new = kx_orig
+        kx_slice2 = stacked_traj.kspace_points_rad_per_m[0, 2*points_per_2d_traj:3*points_per_2d_traj]
+        ky_slice2 = stacked_traj.kspace_points_rad_per_m[1, 2*points_per_2d_traj:3*points_per_2d_traj]
+        np.testing.assert_array_almost_equal(kx_slice2, -original_ky)
+        np.testing.assert_array_almost_equal(ky_slice2, original_kx)
+
+        # Test rotation list shorter than num_slices (last angle repeated)
+        short_rot_angles = [0, 30]
+        stacked_short_rot = stack_2d_trajectory_to_3d(self.traj_2d, num_slices=3, slice_separation_rad_per_m=10, rotation_angles_deg=short_rot_angles)
+        angle_rad_30 = np.deg2rad(30.0)
+        cos_30, sin_30 = np.cos(angle_rad_30), np.sin(angle_rad_30)
+        expected_kx_slice2_short = original_kx * cos_30 - original_ky * sin_30 # Slice 2 should use 30 deg
+        kx_slice2_short = stacked_short_rot.kspace_points_rad_per_m[0, 2*points_per_2d_traj:3*points_per_2d_traj]
+        np.testing.assert_array_almost_equal(kx_slice2_short, expected_kx_slice2_short)
+
+
+    def test_invalid_input_dimension(self):
+        with self.assertRaisesRegex(ValueError, "Input trajectory must be 2-dimensional."):
+            stack_2d_trajectory_to_3d(self.traj_3d_ref, num_slices=3, slice_separation_rad_per_m=10.0)
+
+    def test_invalid_num_slices(self):
+        with self.assertRaisesRegex(ValueError, "Number of slices must be positive."):
+            stack_2d_trajectory_to_3d(self.traj_2d, num_slices=0, slice_separation_rad_per_m=10.0)
+        with self.assertRaisesRegex(ValueError, "Number of slices must be positive."):
+            stack_2d_trajectory_to_3d(self.traj_2d, num_slices=-1, slice_separation_rad_per_m=10.0)
+
 
 class TestConstrainTrajectory(unittest.TestCase):
     def setUp(self):

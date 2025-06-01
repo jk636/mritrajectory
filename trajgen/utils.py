@@ -16,12 +16,202 @@ from typing import Optional, Tuple, Union # Added Optional, Tuple, Union
 
 # Placeholder for Trajectory class import, will be correctly imported when used
 from .trajectory import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
+from typing import List # Added List
 
 __all__ = [
     'constrain_trajectory',
     'reconstruct_image',
-    'display_trajectory'
+    'display_trajectory',
+    'stack_2d_trajectory_to_3d',
+    'rotate_3d_trajectory' # New function
 ]
+
+
+def rotate_3d_trajectory(
+    trajectory_3d: Trajectory,
+    rotation_matrix: Optional[np.ndarray] = None,
+    euler_angles_deg: Optional[Tuple[float, float, float]] = None, # ZYX convention: alpha, beta, gamma
+    output_name_prefix: str = "rotated_"
+) -> Trajectory:
+    """
+    Rotates a 3D k-space trajectory using either a provided rotation matrix
+    or Euler angles (ZYX convention).
+
+    Args:
+        trajectory_3d (Trajectory): The input 3D Trajectory object.
+        rotation_matrix (Optional[np.ndarray]): A 3x3 numpy array representing the
+            rotation matrix.
+        euler_angles_deg (Optional[Tuple[float, float, float]]): A tuple of three
+            Euler angles (alpha, beta, gamma) in degrees, representing rotations
+            around Z, then new Y, then new X axes respectively.
+        output_name_prefix (str): Prefix for the name of the new 3D trajectory.
+
+    Returns:
+        Trajectory: A new 3D Trajectory object with rotated k-space points.
+
+    Raises:
+        ValueError: If the input trajectory is not 3D, if neither or both
+                    rotation_matrix and euler_angles_deg are provided, or
+                    if rotation_matrix has an invalid shape.
+    """
+    if trajectory_3d.get_num_dimensions() != 3:
+        raise ValueError("Input trajectory must be 3-dimensional.")
+
+    if rotation_matrix is None and euler_angles_deg is None:
+        raise ValueError("Either rotation_matrix or euler_angles_deg must be provided.")
+    if rotation_matrix is not None and euler_angles_deg is not None:
+        raise ValueError("Provide either rotation_matrix or euler_angles_deg, not both.")
+
+    final_rotation_matrix: np.ndarray
+
+    if euler_angles_deg is not None:
+        alpha_rad, beta_rad, gamma_rad = np.deg2rad(euler_angles_deg)
+
+        # Rz(alpha)
+        Rz = np.array([
+            [np.cos(alpha_rad), -np.sin(alpha_rad), 0],
+            [np.sin(alpha_rad),  np.cos(alpha_rad), 0],
+            [0,                  0,                 1]
+        ])
+        # Ry(beta)
+        Ry = np.array([
+            [np.cos(beta_rad),  0, np.sin(beta_rad)],
+            [0,                 1, 0],
+            [-np.sin(beta_rad), 0, np.cos(beta_rad)]
+        ])
+        # Rx(gamma)
+        Rx = np.array([
+            [1, 0,                  0],
+            [0, np.cos(gamma_rad), -np.sin(gamma_rad)],
+            [0, np.sin(gamma_rad),  np.cos(gamma_rad)]
+        ])
+        # ZYX convention: Apply Rx, then Ry, then Rz
+        # Combined matrix R = Rz @ Ry @ Rx
+        final_rotation_matrix = Rz @ Ry @ Rx
+        rotation_info = {'euler_angles_deg_ZYX': euler_angles_deg}
+
+    elif rotation_matrix is not None: # Explicitly use elif for clarity
+        if not isinstance(rotation_matrix, np.ndarray) or rotation_matrix.shape != (3, 3):
+            raise ValueError("rotation_matrix must be a 3x3 NumPy array.")
+        final_rotation_matrix = rotation_matrix
+        rotation_info = {'rotation_matrix': rotation_matrix.tolist()} # Store as list for metadata
+
+    k_3d_points = trajectory_3d.kspace_points_rad_per_m # Shape (3, N_points_3d)
+    rotated_k_3d_points = final_rotation_matrix @ k_3d_points
+
+    new_name = output_name_prefix + trajectory_3d.name
+    new_metadata = trajectory_3d.metadata.copy()
+    new_metadata['rotation_applied'] = True
+    new_metadata['rotation_details'] = rotation_info
+
+    # Note: If the original trajectory had pre-computed gradients,
+    # they are now invalid. The Trajectory class will recompute them if asked.
+
+    return Trajectory(
+        name=new_name,
+        kspace_points_rad_per_m=rotated_k_3d_points,
+        dt_seconds=trajectory_3d.dt_seconds,
+        metadata=new_metadata,
+        gamma_Hz_per_T=trajectory_3d.metadata.get('gamma_Hz_per_T', COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']),
+        dead_time_start_seconds=trajectory_3d.dead_time_start_seconds,
+        dead_time_end_seconds=trajectory_3d.dead_time_end_seconds
+    )
+
+
+def stack_2d_trajectory_to_3d(
+    trajectory_2d: Trajectory,
+    num_slices: int,
+    slice_separation_rad_per_m: float,
+    rotation_angles_deg: Optional[List[float]] = None,
+    output_name_prefix: str = "stacked_"
+) -> Trajectory:
+    """
+    Stacks a 2D k-space trajectory along the kz-axis to create a 3D trajectory.
+    Optionally applies in-plane rotations to each slice.
+
+    Args:
+        trajectory_2d (Trajectory): The input 2D Trajectory object.
+        num_slices (int): The number of slices to stack in the kz direction.
+        slice_separation_rad_per_m (float): The k-space separation between adjacent slices in rad/m.
+        rotation_angles_deg (Optional[List[float]]): A list of in-plane rotation angles
+            in degrees, one for each slice. If None, no rotation is applied.
+            If the list is shorter than num_slices, the last angle is repeated.
+        output_name_prefix (str): Prefix for the name of the new 3D trajectory.
+
+    Returns:
+        Trajectory: A new 3D Trajectory object.
+
+    Raises:
+        ValueError: If the input trajectory is not 2D, or if num_slices is not positive.
+    """
+    if trajectory_2d.get_num_dimensions() != 2:
+        raise ValueError("Input trajectory must be 2-dimensional.")
+    if num_slices <= 0:
+        raise ValueError("Number of slices must be positive.")
+
+    k_2d_points = trajectory_2d.kspace_points_rad_per_m  # Shape (2, N_points_2d)
+    n_points_2d = trajectory_2d.get_num_points()
+
+    all_3d_points_segments = []
+
+    kz_base_offsets = np.linspace(
+        -(num_slices - 1) / 2.0 * slice_separation_rad_per_m,
+        (num_slices - 1) / 2.0 * slice_separation_rad_per_m,
+        num_slices
+    )
+
+    for i_slice in range(num_slices):
+        current_k_slice_2d = np.copy(k_2d_points)
+        angle_rad = 0.0
+
+        if rotation_angles_deg:
+            if i_slice < len(rotation_angles_deg):
+                angle_rad = np.deg2rad(rotation_angles_deg[i_slice])
+            elif rotation_angles_deg: # Not empty list
+                angle_rad = np.deg2rad(rotation_angles_deg[-1])
+
+        if angle_rad != 0.0:
+            rot_mat_2d = np.array([
+                [np.cos(angle_rad), -np.sin(angle_rad)],
+                [np.sin(angle_rad), np.cos(angle_rad)]
+            ])
+            current_k_slice_2d = rot_mat_2d @ current_k_slice_2d
+
+        kx_rotated = current_k_slice_2d[0, :]
+        ky_rotated = current_k_slice_2d[1, :]
+        kz_values = np.full_like(kx_rotated, kz_base_offsets[i_slice])
+
+        k_slice_3d = np.vstack((kx_rotated, ky_rotated, kz_values)) # Shape (3, N_points_2d)
+        all_3d_points_segments.append(k_slice_3d)
+
+    final_k_3d_points = np.concatenate(all_3d_points_segments, axis=1)
+
+    new_name = output_name_prefix + trajectory_2d.name
+    new_metadata = trajectory_2d.metadata.copy()
+    new_metadata['num_dimensions'] = 3
+    new_metadata['original_2d_trajectory_name'] = trajectory_2d.name
+    new_metadata['stacking_parameters'] = {
+        'num_slices': num_slices,
+        'slice_separation_rad_per_m': slice_separation_rad_per_m,
+        'rotation_angles_deg': rotation_angles_deg if rotation_angles_deg else [0.0] * num_slices,
+        'original_num_points_per_slice': n_points_2d
+    }
+    # Preserve sequence_params if they exist, but they are specific to the original sequence
+    # and might not fully describe the new stacked trajectory's generation method.
+    # For now, we just copy all metadata which includes sequence_params.
+
+    return Trajectory(
+        name=new_name,
+        kspace_points_rad_per_m=final_k_3d_points,
+        dt_seconds=trajectory_2d.dt_seconds, # dt remains the same for each point
+        metadata=new_metadata,
+        gamma_Hz_per_T=trajectory_2d.metadata.get('gamma_Hz_per_T', COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']),
+        dead_time_start_seconds=trajectory_2d.dead_time_start_seconds, # These apply to the whole acquisition
+        dead_time_end_seconds=trajectory_2d.dead_time_end_seconds,
+        # sequence_params from original traj is in new_metadata.
+        # The new trajectory is not directly a "sequence" from a sequence class anymore.
+    )
+
 
 def constrain_trajectory(
     trajectory_obj: Trajectory,

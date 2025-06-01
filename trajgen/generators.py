@@ -20,7 +20,9 @@ __all__ = [
     'generate_cones_trajectory',
     'generate_epi_trajectory',
     'generate_rosette_trajectory',
-    'generate_tpi_trajectory'
+    'generate_tpi_trajectory',
+    'generate_propeller_blade_trajectory',
+    'generate_wave_caipi_trajectory' # New
 ]
 
 # Existing imports:
@@ -136,6 +138,235 @@ def generate_tpi_trajectory(
     # it could modify num_twists or points_per_segment before generation,
     # or affect spiral density (turns) which is implicitly handled by spiral_turns_per_twist.
     # For this basic version, it's a placeholder.
+
+    return final_k_points
+
+
+def generate_wave_caipi_trajectory(
+    fov_mm: Union[float, Tuple[float, float]],
+    resolution_mm: Union[float, Tuple[float, float]],
+    num_echoes: int,
+    points_per_echo: int,
+    wave_amplitude_mm: float,
+    wave_frequency_cycles_per_fov_readout: float,
+    wave_phase_offset_rad: float = 0.0,
+    epi_type: str = 'flyback', # Affects readout reversal, not wave itself directly here
+    phase_encode_direction: str = 'y', # 'y': kx readout, ky phase; 'x': ky readout, kx phase
+    undersampling_factor_pe: float = 1.0, # Undersampling in phase-encode direction
+    gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+) -> np.ndarray:
+    """
+    Generates a 2D Wave-CAIPI k-space trajectory (based on EPI).
+
+    The "Wave" component adds a sinusoidal k-space offset to the phase-encode coordinate,
+    modulated along the readout direction.
+
+    Parameters:
+    - fov_mm: Field of view in mm for the underlying EPI (e.g., (256, 256)).
+    - resolution_mm: Resolution in mm for the underlying EPI (e.g., (2, 2)).
+    - num_echoes (int): Total number of phase-encode lines before undersampling.
+    - points_per_echo (int): Number of readout points per echo.
+    - wave_amplitude_mm (float): Amplitude of the FOV shift in mm caused by the wave gradient,
+                                 applied along the phase-encode axis.
+    - wave_frequency_cycles_per_fov_readout (float): Number of full sine wave cycles
+                                                     across the readout FOV.
+    - wave_phase_offset_rad (float): Phase offset for the sine wave modulation.
+    - epi_type (str): 'flyback' or 'gradient_recalled' (for EPI echo behavior).
+    - phase_encode_direction (str): 'y' (kx readout, ky phase) or 'x' (ky readout, kx phase).
+    - undersampling_factor_pe (float): Undersampling factor for phase-encode lines (e.g., 2.0 for R=2).
+    - gamma_Hz_per_T (float): Gyromagnetic ratio.
+
+    Returns:
+    - np.ndarray: K-space points of shape (2, num_acquired_echoes * points_per_echo) in rad/m.
+    """
+    num_dimensions = 2
+
+    if isinstance(fov_mm, (int, float)):
+        fov_mm_tuple: Tuple[float, ...] = (float(fov_mm), float(fov_mm))
+    elif isinstance(fov_mm, (tuple, list)) and len(fov_mm) == num_dimensions:
+        fov_mm_tuple = tuple(map(float, fov_mm))
+    else:
+        raise ValueError(f"fov_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if isinstance(resolution_mm, (int, float)):
+        resolution_mm_tuple: Tuple[float, ...] = (float(resolution_mm), float(resolution_mm))
+    elif isinstance(resolution_mm, (tuple, list)) and len(resolution_mm) == num_dimensions:
+        resolution_mm_tuple = tuple(map(float, resolution_mm))
+    else:
+        raise ValueError(f"resolution_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if num_echoes <= 0 or points_per_echo <= 0:
+        raise ValueError("num_echoes and points_per_echo must be positive.")
+    if undersampling_factor_pe < 1.0:
+        raise ValueError("undersampling_factor_pe must be >= 1.0.")
+
+    fov_m = np.array(fov_mm_tuple) / 1000.0
+    resolution_m = np.array(resolution_mm_tuple) / 1000.0
+
+    readout_dim_idx_val = 0 if phase_encode_direction == 'y' else 1
+    phase_dim_idx_val = 1 if phase_encode_direction == 'y' else 0
+
+    k_max_readout = 1.0 / (2.0 * resolution_m[readout_dim_idx_val])
+    k_max_phase_encode = 1.0 / (2.0 * resolution_m[phase_dim_idx_val])
+    delta_k_phase = 1.0 / fov_m[phase_dim_idx_val]
+
+    # Base k-space coordinates for one echo line (readout direction)
+    kx_line_template = np.linspace(-k_max_readout, k_max_readout, points_per_echo, endpoint=True)
+
+    # Wave component calculation
+    # Normalize kx_line_template to [0, 1] for wave modulation
+    kx_normalized_for_wave = (kx_line_template - (-k_max_readout)) / (2 * k_max_readout)
+
+    # Convert wave_amplitude_mm to k-space shift amplitude in rad/m
+    k_shift_amplitude_rad_per_m = (wave_amplitude_mm / (fov_mm_tuple[phase_dim_idx_val] / 2.0)) * k_max_phase_encode
+    if fov_mm_tuple[phase_dim_idx_val] == 0:
+        k_shift_amplitude_rad_per_m = 0.0
+
+    wave_k_offset_readout = k_shift_amplitude_rad_per_m * np.sin(
+        2 * np.pi * wave_frequency_cycles_per_fov_readout * kx_normalized_for_wave + wave_phase_offset_rad
+    )
+
+    acquired_echo_k_segments = []
+    num_acquired_echoes = 0
+
+    for i_true_echo in range(num_echoes):
+        if undersampling_factor_pe > 1 and (i_true_echo % int(round(undersampling_factor_pe)) != 0) :
+            continue
+
+        num_acquired_echoes += 1
+
+        ky_val_base = -k_max_phase_encode + i_true_echo * delta_k_phase
+
+        current_kx_readout = np.copy(kx_line_template)
+        current_wave_k_offset = np.copy(wave_k_offset_readout)
+        if epi_type == 'gradient_recalled' and (num_acquired_echoes -1) % 2 != 0:
+            current_kx_readout = current_kx_readout[::-1]
+            current_wave_k_offset = current_wave_k_offset[::-1]
+
+        if phase_encode_direction == 'y':
+            kx_final_echo = current_kx_readout
+            ky_final_echo = ky_val_base + current_wave_k_offset
+            acquired_echo_k_segments.append(np.vstack((kx_final_echo, ky_final_echo)))
+        else:
+            ky_final_echo = current_kx_readout
+            kx_final_echo = ky_val_base + current_wave_k_offset
+            acquired_echo_k_segments.append(np.vstack((kx_final_echo, ky_final_echo)))
+
+    if not acquired_echo_k_segments:
+        return np.zeros((2, 0))
+
+    final_k_points = np.concatenate(acquired_echo_k_segments, axis=1)
+    return final_k_points
+
+
+def generate_propeller_blade_trajectory(
+    fov_mm: Union[float, Tuple[float, float]],
+    resolution_mm: Union[float, Tuple[float, float]],
+    num_blades: int,
+    lines_per_blade: int,
+    points_per_line: int,
+    blade_rotation_angle_increment_deg: float,
+    gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+) -> np.ndarray:
+    """
+    Generates a 2D PROPELLER/BLADE k-space trajectory.
+    Each "blade" is a small Cartesian k-space acquisition (a strip)
+    that is rotated around the k-space center.
+
+    Parameters:
+    - fov_mm: Field of view for a single blade/strip in mm (e.g., (256, 32) or 256 for isotropic blade FOV).
+              The first component is along the readout (points_per_line),
+              the second along the phase-encode direction of the blade (lines_per_blade).
+    - resolution_mm: Resolution within a single blade in mm (e.g., (1, 4) or 1 for isotropic blade res).
+    - num_blades (int): Number of blades to acquire.
+    - lines_per_blade (int): Number of phase-encode lines within each blade.
+    - points_per_line (int): Number of readout points along each line within a blade.
+    - blade_rotation_angle_increment_deg (float): Angle in degrees to rotate each successive blade.
+    - gamma_Hz_per_T (float): Gyromagnetic ratio (currently for consistency, not direct use in k-space calc).
+
+    Returns:
+    - np.ndarray: K-space points of shape (2, num_blades * lines_per_blade * points_per_line) in rad/m.
+    """
+    num_dimensions = 2
+
+    if isinstance(fov_mm, (int, float)):
+        fov_mm_tuple: Tuple[float, ...] = (float(fov_mm), float(fov_mm)) # Assume square if single val
+    elif isinstance(fov_mm, (tuple, list)) and len(fov_mm) == num_dimensions:
+        fov_mm_tuple = tuple(map(float, fov_mm))
+    else:
+        raise ValueError(f"fov_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if isinstance(resolution_mm, (int, float)):
+        resolution_mm_tuple: Tuple[float, ...] = (float(resolution_mm), float(resolution_mm))
+    elif isinstance(resolution_mm, (tuple, list)) and len(resolution_mm) == num_dimensions:
+        resolution_mm_tuple = tuple(map(float, resolution_mm))
+    else:
+        raise ValueError(f"resolution_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if num_blades <= 0 or lines_per_blade <= 0 or points_per_line <= 0:
+        raise ValueError("num_blades, lines_per_blade, and points_per_line must be positive.")
+
+    fov_m = np.array(fov_mm_tuple) / 1000.0
+    resolution_m = np.array(resolution_mm_tuple) / 1000.0
+
+    # k_max for the blade dimensions
+    # k_max_x_blade is along the readout direction of the blade (points_per_line)
+    # k_max_y_blade is along the phase-encode direction of the blade (lines_per_blade)
+    k_max_x_blade = 1.0 / (2.0 * resolution_m[0])
+    # For phase direction, k_max is (N_pe-1)/2 * delta_k_pe
+    # delta_ky_blade = 1.0 / fov_m[1] (FOV in phase direction of blade)
+    # k_max_y_blade_extent = (lines_per_blade - 1) / 2.0 * delta_ky_blade
+    # This means ky_vals_blade will span from -k_max_y_blade_extent to +k_max_y_blade_extent
+
+    delta_ky_blade = 1.0 / fov_m[1] # k-space step between phase-encode lines in a blade
+
+    all_k_points_list = []
+
+    # Create kx values for a single line (readout direction of the blade)
+    # These are centered at 0 before rotation.
+    kx_vals_line = np.linspace(-k_max_x_blade, k_max_x_blade, points_per_line, endpoint=True)
+
+    # Create ky values for the phase-encode lines within a blade
+    # These are also centered at 0 before rotation.
+    if lines_per_blade == 1:
+        ky_vals_blade = np.array([0.0])
+    else:
+        ky_vals_blade = np.linspace(
+            -(lines_per_blade - 1) / 2.0 * delta_ky_blade,
+            (lines_per_blade - 1) / 2.0 * delta_ky_blade,
+            lines_per_blade,
+            endpoint=True
+        )
+
+    # Generate points for one blade, centered at origin
+    blade_k_points_local_list = []
+    for i_line in range(lines_per_blade):
+        kx_current_line = kx_vals_line
+        ky_current_line = np.full_like(kx_vals_line, ky_vals_blade[i_line])
+        blade_k_points_local_list.append(np.vstack((kx_current_line, ky_current_line)))
+
+    blade_k_points_local = np.concatenate(blade_k_points_local_list, axis=1) # Shape (2, lines_per_blade * points_per_line)
+
+
+    for i_blade in range(num_blades):
+        current_rotation_rad = np.deg2rad(i_blade * blade_rotation_angle_increment_deg)
+
+        cos_rot = np.cos(current_rotation_rad)
+        sin_rot = np.sin(current_rotation_rad)
+
+        rot_mat_2d = np.array([
+            [cos_rot, -sin_rot],
+            [sin_rot,  cos_rot]
+        ])
+
+        # Rotate a copy of the local blade points
+        rotated_blade_k_points = rot_mat_2d @ blade_k_points_local
+        all_k_points_list.append(rotated_blade_k_points)
+
+    if not all_k_points_list: # Should not happen if num_blades > 0
+        return np.zeros((2, 0))
+
+    final_k_points = np.concatenate(all_k_points_list, axis=1)
 
     return final_k_points
 

@@ -30,7 +30,8 @@ from . import sequences  # New
 from .generators import (
     generate_spiral_trajectory, generate_radial_trajectory,
     generate_cones_trajectory, generate_epi_trajectory,
-    generate_rosette_trajectory, generate_tpi_trajectory  # New
+    generate_rosette_trajectory, generate_tpi_trajectory,
+    generate_propeller_blade_trajectory, generate_wave_caipi_trajectory # New
 )
 
 # For easier access to specific utility functions if desired
@@ -50,7 +51,9 @@ __all__ = [
     'generate_cones_trajectory',
     'generate_epi_trajectory',
     'generate_rosette_trajectory',
-    'generate_tpi_trajectory',  # New
+    'generate_tpi_trajectory',
+    'generate_propeller_blade_trajectory',
+    'generate_wave_caipi_trajectory', # New
     'constrain_trajectory',
     'reconstruct_image',
     'display_trajectory',
