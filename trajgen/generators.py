@@ -23,7 +23,8 @@ __all__ = [
     'generate_tpi_trajectory',
     'generate_propeller_blade_trajectory',
     'generate_wave_caipi_trajectory',
-    'generate_drunken_spiral_trajectory' # New
+    'generate_drunken_spiral_trajectory',
+    'generate_drunken_kooshball_trajectory' # New
 ]
 
 # Existing imports:
@@ -174,6 +175,149 @@ def generate_drunken_spiral_trajectory(
             print(warning_msg)
 
     return k_points
+
+
+def generate_drunken_kooshball_trajectory(
+    fov_mm: Union[float, Tuple[float, float, float]],
+    resolution_mm: Union[float, Tuple[float, float, float]],
+    num_points: int,
+    dt_seconds: float,
+    base_spherical_spiral_turns: float = 10.0,
+    perturbation_amplitude_factor: float = 0.1,
+    density_sigma_factor: float = 0.25,
+    max_grad_Tm_per_m: Optional[float] = None,
+    max_slew_Tm_per_s_per_m: Optional[float] = None, # Assuming T/m/s
+    gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
+    num_smoothing_iterations: int = 3,
+    smoothing_kernel_size: int = 5
+) -> np.ndarray:
+    """
+    Generates a 3D "drunken kooshball" k-space trajectory.
+
+    This trajectory starts with a base 3D spherical spiral and adds weighted
+    random perturbations to its kx, ky, and kz components.
+    It iteratively attempts to smooth the trajectory to meet optional
+    gradient and slew rate constraints.
+
+    Parameters:
+    - fov_mm: Field of view in mm (isotropic or per dimension).
+    - resolution_mm: Desired resolution in mm (isotropic or per dimension).
+    - num_points (int): Total number of k-space points for the trajectory.
+    - dt_seconds (float): Dwell time (time between k-space samples) in seconds.
+    - base_spherical_spiral_turns (float): Number of turns for the spherical spiral's phi component.
+    - perturbation_amplitude_factor (float): Factor scaling random noise amplitude.
+                                           Relative to k_max / cbrt(num_points).
+    - density_sigma_factor (float): Sigma for Gaussian weighting of noise, relative to k_max.
+                                    Noise is stronger at k-space center.
+    - max_grad_Tm_per_m (Optional[float]): Maximum gradient amplitude constraint (T/m).
+    - max_slew_Tm_per_s_per_m (Optional[float]): Maximum slew rate constraint (T/m/s).
+    - gamma_Hz_per_T (float): Gyromagnetic ratio.
+    - num_smoothing_iterations (int): Iterations for smoothing if constraints are violated.
+    - smoothing_kernel_size (int): Kernel size for smoothing (must be odd).
+
+    Returns:
+    - np.ndarray: K-space points of shape (3, num_points) in rad/m.
+    """
+    num_dimensions = 3
+
+    if num_points <= 0:
+        raise ValueError("num_points must be positive.")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be positive.")
+    if smoothing_kernel_size <= 0 or smoothing_kernel_size % 2 == 0:
+        raise ValueError("smoothing_kernel_size must be positive and odd.")
+
+    if isinstance(fov_mm, (int, float)):
+        fov_mm_tuple: Tuple[float, ...] = tuple([float(fov_mm)] * num_dimensions)
+    elif isinstance(fov_mm, (tuple, list)) and len(fov_mm) == num_dimensions:
+        fov_mm_tuple = tuple(map(float, fov_mm))
+    else:
+        raise ValueError(f"fov_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if isinstance(resolution_mm, (int, float)):
+        resolution_mm_tuple: Tuple[float, ...] = tuple([float(resolution_mm)] * num_dimensions)
+    elif isinstance(resolution_mm, (tuple, list)) and len(resolution_mm) == num_dimensions:
+        resolution_mm_tuple = tuple(map(float, resolution_mm))
+    else:
+        raise ValueError(f"resolution_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    resolution_m = np.array(resolution_mm_tuple) / 1000.0
+    k_max_rad_per_m = np.min(1.0 / (2.0 * resolution_m))
+
+    # Base 3D Spherical Spiral
+    t = np.linspace(0, 1, num_points, endpoint=True) # Normalized time/progression parameter
+    r_base = t * k_max_rad_per_m
+
+    # Theta from 0 to pi for uniform surface sampling density w.r.t. t
+    theta_base = np.arccos(1 - 2 * t) # More uniform than simple linear t * pi
+
+    phi_base = np.linspace(0, base_spherical_spiral_turns * 2 * np.pi, num_points, endpoint=True)
+
+    kx_base = r_base * np.sin(theta_base) * np.cos(phi_base)
+    ky_base = r_base * np.sin(theta_base) * np.sin(phi_base)
+    kz_base = r_base * np.cos(theta_base)
+
+    base_k_points = np.vstack((kx_base, ky_base, kz_base))
+
+    # Noise Generation
+    noise_k = np.random.normal(0, 1, (num_dimensions, num_points))
+
+    # Density Weighting for Noise
+    radial_distance_normalized_sq = (r_base / (k_max_rad_per_m + 1e-9))**2
+    weight = np.exp(-radial_distance_normalized_sq / (density_sigma_factor**2 + 1e-9)) # Weight is (N,)
+
+    # Perturbation Scaling
+    perturb_scale = perturbation_amplitude_factor * (k_max_rad_per_m / (np.cbrt(num_points) + 1e-9))
+
+    # Apply Perturbation (element-wise for noise, broadcast weight and perturb_scale)
+    k_perturbed = base_k_points + weight * noise_k * perturb_scale # (3,N) + (N,)*(3,N)*(scalar) -> (3,N)
+
+    if num_points == 1:
+        return k_perturbed
+
+    # Iterative Constraint Application & Smoothing
+    for i_iter in range(num_smoothing_iterations):
+        if k_perturbed.shape[1] < 2: break
+
+        gradients = np.gradient(k_perturbed, dt_seconds, axis=1) / gamma_Hz_per_T
+
+        if k_perturbed.shape[1] > 1:
+            slew_rates_diff = np.diff(gradients, axis=1) / dt_seconds
+            slew_padded = np.pad(slew_rates_diff, ((0,0),(0,1)), mode='edge')
+        else:
+            slew_padded = np.zeros_like(gradients)
+
+        grad_norm = np.linalg.norm(gradients, axis=0)
+        slew_norm = np.linalg.norm(slew_padded, axis=0)
+
+        max_achieved_grad = np.max(grad_norm) if grad_norm.size > 0 else 0
+        max_achieved_slew = np.max(slew_norm) if slew_norm.size > 0 else 0
+
+        grad_ok = (max_grad_Tm_per_m is None) or (max_achieved_grad <= max_grad_Tm_per_m)
+        slew_ok = (max_slew_Tm_per_s_per_m is None) or (max_achieved_slew <= max_slew_Tm_per_s_per_m)
+
+        if grad_ok and slew_ok:
+            print(f"Drunken Kooshball: Constraints met at iteration {i_iter+1}.")
+            break
+
+        if i_iter < num_smoothing_iterations - 1:
+            if k_perturbed.shape[1] >= smoothing_kernel_size:
+                smoothing_filter = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+                for dim_idx in range(num_dimensions):
+                    k_perturbed[dim_idx,:] = np.convolve(k_perturbed[dim_idx,:], smoothing_filter, mode='same')
+            else:
+                print(f"Drunken Kooshball: Not enough points ({k_perturbed.shape[1]}) for smoothing kernel size {smoothing_kernel_size} at iter {i_iter+1}. Stopping smoothing.")
+                break
+
+        if i_iter == num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
+            warning_msg = "Drunken Kooshball: Constraints not fully met after smoothing iterations."
+            if not grad_ok and max_grad_Tm_per_m is not None:
+                warning_msg += f" Max grad: {max_achieved_grad:.2f} T/m (Limit: {max_grad_Tm_per_m:.2f} T/m)."
+            if not slew_ok and max_slew_Tm_per_s_per_m is not None:
+                warning_msg += f" Max slew: {max_achieved_slew:.2f} T/m/s (Limit: {max_slew_Tm_per_s_per_m:.2f} T/m/s)."
+            print(warning_msg)
+
+    return k_perturbed
 
 
 def generate_tpi_trajectory(

@@ -10,7 +10,8 @@ from .radial import RadialSequence
 from .tpi import TwistedProjectionImagingSequence
 from .propeller import PropellerBladeSequence
 from .wave_caipi import WaveCAIPISequence
-from .drunken_spiral import DrunkenSpiralSequence # New
+from .drunken_spiral import DrunkenSpiralSequence
+from .drunken_kooshball import DrunkenKooshballSequence # New
 
 __all__ = [
     'VariableDensitySpiralSequence',
@@ -18,5 +19,6 @@ __all__ = [
     'TwistedProjectionImagingSequence',
     'PropellerBladeSequence',
     'WaveCAIPISequence',
-    'DrunkenSpiralSequence' # New
+    'DrunkenSpiralSequence',
+    'DrunkenKooshballSequence' # New
 ]
