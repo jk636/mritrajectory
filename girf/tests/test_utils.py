@@ -210,5 +210,34 @@ class TestUtils(unittest.TestCase):
         self.assertAlmostEqual(utils.absolute_value(3+4j), 5.0)
         np.testing.assert_array_almost_equal(utils.absolute_value(np.array([3+4j, -6-8j])), np.array([5.0, 10.0]))
 
+    def test_check_vector_slew_rate(self):
+        # Test with 2D slew rates (should be skipped and return True)
+        sr_array_2elements = np.array([[100e6, 50e6], [120e6, 80e6]]) # (2,2)
+        smax_vec_limit = 100e6
+        # Current implementation of check_vector_slew_rate skips 1D, not 2-element.
+        # It requires sr_array.shape[1] > 1. So this will run.
+        # Vector slew for point 0: sqrt(100^2 + 50^2) = sqrt(10000+2500) = sqrt(12500) = 111.8e6
+        # Vector slew for point 1: sqrt(120^2 + 80^2) = sqrt(14400+6400) = sqrt(20800) = 144.2e6
+
+        ok_vec, max_vec, details = utils.check_vector_slew_rate(sr_array_2elements, smax_vec_limit)
+        self.assertFalse(ok_vec) # 144.2e6 > 100e6
+        self.assertAlmostEqual(max_vec, np.sqrt(120e6**2 + 80e6**2))
+        self.assertEqual(details['first_exceeding_time_idx'], 1)
+
+        # Test with compliant 3D slew rates
+        sr_array_3d_ok = np.array([[10e6, 20e6, 30e6], [40e6, 50e6, 60e6]])
+        # Max vector for point 1: sqrt(40^2+50^2+60^2) = sqrt(1600+2500+3600) = sqrt(7700) = 87.75e6
+        smax_vec_compliant = 90e6
+        ok_vec_c, max_vec_c, _ = utils.check_vector_slew_rate(sr_array_3d_ok, smax_vec_compliant)
+        self.assertTrue(ok_vec_c)
+        self.assertAlmostEqual(max_vec_c, np.sqrt(40e6**2 + 50e6**2 + 60e6**2))
+
+        # Test with 1D slew rates (should be skipped by the function and return True)
+        sr_array_1d = np.array([[100e6], [150e6], [120e6]]) # (3,1)
+        ok_vec_1d, _, details_1d = utils.check_vector_slew_rate(sr_array_1d, 100e6) # Limit doesn't matter here
+        self.assertTrue(ok_vec_1d)
+        self.assertIn("skipped or not applicable", details_1d['message'])
+
+
 if __name__ == '__main__':
     unittest.main()

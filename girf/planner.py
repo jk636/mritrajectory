@@ -11,9 +11,11 @@ except ImportError:
 try:
     from .pns import PNSModel
     from .predictor import TrajectoryPredictor
+    from . import utils # Import the utils module
 except ImportError:
     PNSModel = None
     TrajectoryPredictor = None
+    utils = None # Handle if utils cannot be imported (e.g. circular dependency if not careful)
 
 # Gyromagnetic ratio for protons in Hz/T
 DEFAULT_GAMMA_PROTON = 42.576e6
@@ -45,16 +47,26 @@ class TrajectoryPlanner:
         self.dt = dt
         self.gamma = gamma
 
+        # Ensure constraints like Gmax_T_per_m, Smax_T_per_m_per_s, etc. are present
+        # Defaulting them here if not provided.
+        self.constraints.setdefault('Gmax_T_per_m', 0.04)
+        self.constraints.setdefault('Smax_T_per_m_per_s', 150)
+        # thermal_limits is optional, no default needed here, its presence will be checked by methods.
+        self.constraints.setdefault('thermal_limits', {})
+
+
         if PNSModel is None and pns_model_instance is None:
             print("Warning: PNSModel class not available and no instance provided. PNS checks will be skipped.")
             self.pns_model = None
         else:
-            self.pns_model = pns_model_instance if pns_model_instance else (PNSModel() if PNSModel else None)
-            if self.pns_model and hasattr(self.pns_model, 'pns_thresholds') and 'PNS_threshold_factor' in self.constraints:
-                 # Basic way to link constraints to a simple PNS model threshold if applicable
-                 # This is highly dependent on the PNSModel's specific implementation
-                 if self.pns_model.pns_thresholds is None: self.pns_model.pns_thresholds = {} # Ensure it's a dict
-                 # Example: self.pns_model.pns_thresholds['global_factor'] = self.constraints['PNS_threshold_factor']
+            # If pns_model_instance is provided, use it. Otherwise, create a new one.
+            # Pass relevant constraints to PNSModel if creating it here.
+            pns_thresholds_from_planner_constraints = self.constraints.get('pns_model_thresholds') # Explicit key
+            if not pns_thresholds_from_planner_constraints and 'PNS_threshold_factor' in self.constraints: # Older way
+                 pns_thresholds_from_planner_constraints = {'max_total_pns_normalized': self.constraints['PNS_threshold_factor']}
+
+            self.pns_model = pns_model_instance if pns_model_instance else \
+                             (PNSModel(pns_thresholds=pns_thresholds_from_planner_constraints, dt=self.dt) if PNSModel else None)
 
 
         if TrajectoryPredictor is None and trajectory_predictor_instance is None:
@@ -63,13 +75,17 @@ class TrajectoryPlanner:
         else:
             self.trajectory_predictor = trajectory_predictor_instance if trajectory_predictor_instance else \
                                        (TrajectoryPredictor(dt=self.dt, gamma=self.gamma, girf_spectra=self.girf_spectra) if TrajectoryPredictor else None)
-            if self.trajectory_predictor and not self.trajectory_predictor.girf_spectra and self.girf_spectra:
-                 self.trajectory_predictor.girf_spectra = self.girf_spectra # Ensure predictor has GIRF
-            if self.trajectory_predictor and self.trajectory_predictor.dt is None:
-                self.trajectory_predictor.dt = self.dt
+            if self.trajectory_predictor : # Ensure predictor has the latest GIRF and dt from planner
+                if not self.trajectory_predictor.girf_spectra and self.girf_spectra:
+                     self.trajectory_predictor.girf_spectra = self.girf_spectra
+                if self.trajectory_predictor.dt is None : self.trajectory_predictor.dt = self.dt
+                if not self.trajectory_predictor.harmonic_components and hasattr(self, 'harmonic_components') and self.harmonic_components:
+                     self.trajectory_predictor.harmonic_components = self.harmonic_components
 
 
-        print(f"TrajectoryPlanner initialized. dt={self.dt} s.")
+        print(f"TrajectoryPlanner initialized. dt={self.dt*1e6:.1f}us. Constraints: Gmax={self.constraints['Gmax_T_per_m']*1e3:.1f}mT/m, Smax={self.constraints['Smax_T_per_m_per_s']:.0f}T/m/s" +
+              (f", Smax_vec={self.constraints['Smax_vector_T_per_m_per_s']:.0f}T/m/s" if 'Smax_vector_T_per_m_per_s' in self.constraints else ""))
+
 
     def load_girf(self, girf_data_or_path):
         """ Loads GIRF spectra, similar to TrajectoryPredictor. """
@@ -139,33 +155,57 @@ class TrajectoryPlanner:
         return trajectory_kspace
 
     def _check_hardware_constraints(self, gradients_time):
-        """ Checks gradient and slew rate limits. """
-        if not isinstance(gradients_time, np.ndarray): gradients_time = np.asarray(gradients_time)
-        if gradients_time.ndim == 1: gradients_time = gradients_time[:, np.newaxis]
+        """
+        Checks gradient (per-axis), slew rate (per-axis), and optionally vector slew rate limits.
+        Returns a consolidated hardware status (bool) and a detailed violation report (dict).
+        """
+        if utils is None:
+            raise ImportError("girf.utils module not imported, cannot perform hardware checks.")
 
-        Gmax = self.constraints.get('Gmax_T_per_m', 0.04) # Tesla/m
-        Smax = self.constraints.get('Smax_T_per_m_per_s', 150) # Tesla/m/s
+        g_array = utils.standardize_trajectory_format(gradients_time, target_format='array',
+                                                     default_axis_names=['x', 'y', 'z'][:gradients_time.shape[1] if hasattr(gradients_time, 'shape') else 1])
 
-        violations = {}
-        hw_ok = True
 
-        # Check Gmax
-        abs_grads = np.abs(gradients_time)
-        if np.any(abs_grads > Gmax):
-            hw_ok = False
-            violations['Gmax'] = f"Max grad {np.max(abs_grads):.4f} T/m exceeds limit {Gmax:.4f} T/m"
+        # Get limits from constraints
+        gmax_limit = self.constraints.get('Gmax_T_per_m')
+        smax_axis_limit = self.constraints.get('Smax_T_per_m_per_s')
+        smax_vector_limit = self.constraints.get('Smax_vector_T_per_m_per_s') # Optional
+        tolerance = self.constraints.get('tolerance', 1e-9)
 
-        # Check Smax
-        slew_rates = np.diff(gradients_time, axis=0, prepend=gradients_time[0:1,:]) / self.dt
-        # Correcting first slew: s[0] = g[0]/dt (assuming g[-1]=0)
-        slew_rates[0,:] = gradients_time[0,:] / self.dt
+        # --- Per-axis Gradient Check ---
+        g_ok, max_g_found, g_details_report = utils.check_gradient_strength(
+            g_array, gmax_limit, tolerance
+        )
 
-        abs_slews = np.abs(slew_rates)
-        if np.any(abs_slews > Smax):
-            hw_ok = False
-            violations['Smax'] = f"Max slew {np.max(abs_slews):.1f} T/m/s exceeds limit {Smax:.1f} T/m/s"
+        # --- Per-axis Slew Rate Calculation & Check ---
+        slew_rates_arr = utils.compute_slew_rates(g_array, self.dt, output_format='array')
+        s_axis_ok, max_s_axis_found, s_axis_details_report = utils.check_slew_rate(
+            slew_rates_arr, smax_axis_limit, tolerance
+        )
 
-        return hw_ok, violations
+        # --- Vector Slew Rate Check (Optional) ---
+        s_vec_ok = True # Default to True if not checked
+        max_s_vec_found = 0.0
+        s_vec_details_report = {'message': 'Not checked or not applicable.'}
+
+        if smax_vector_limit is not None:
+            if slew_rates_arr.shape[1] > 1: # Only for multi-axis data
+                s_vec_ok, max_s_vec_found, s_vec_details_report = utils.check_vector_slew_rate(
+                    slew_rates_arr, smax_vector_limit, tolerance
+                )
+            else: # 1D data
+                s_vec_details_report['message'] = "Vector slew check skipped for 1D gradient data."
+
+        overall_hw_ok = g_ok and s_axis_ok and s_vec_ok
+
+        # Consolidate report
+        hw_report = {
+            'overall_ok': overall_hw_ok,
+            'G_ok': g_ok, 'max_G_found_T_per_m': max_g_found, 'G_details': g_details_report,
+            'S_axis_ok': s_axis_ok, 'max_S_axis_found_T_per_m_per_s': max_s_axis_found, 'S_axis_details': s_axis_details_report,
+            'S_vector_ok': s_vec_ok, 'max_S_vector_found_T_per_m_per_s': max_s_vec_found, 'S_vector_details': s_vec_details_report
+        }
+        return overall_hw_ok, hw_report # Return overall status and the detailed report dict
 
     def _generate_archimedean_spiral(self, num_points, k_max_cycles_per_m, num_revolutions, num_axes=2):
         """ Generates a simple 2D Archimedean spiral k-space trajectory. """
@@ -322,24 +362,146 @@ class TrajectoryPlanner:
             pns_slew_input = {f'axis_{idx}': slew_rates_calc[:, idx] for idx in range(num_axes_pns)}
 
             try:
-                # This depends on PNSModel's API. Let's assume compute_pns takes dict and returns dict.
-                # And check_limits uses internal thresholds or passed ones.
-                self.pns_model.slew_rates = pns_slew_input # Set slew rates in model
-                pns_values_computed = self.pns_model.compute_pns() # Compute PNS values
-                pns_ok = self.pns_model.check_limits() # Check against its thresholds
-                pns_report = {
-                    "status": "Checked",
-                    "is_compliant": pns_ok,
-                    "pns_values": pns_values_computed,
-                    "thresholds_used": getattr(self.pns_model, 'pns_thresholds', 'Not set in model')
-                }
-            except Exception as e:
-                pns_ok = False # Fail safe
-                pns_report = {"status": "Error during PNS check", "error_message": str(e)}
-                print(f"Error during PNS check: {e}")
+        # This depends on PNSModel's API.
+        try:
+            # PNSModel's compute_pns now takes slew_rates directly.
+            pns_values_computed_ts = self.pns_model.compute_pns(pns_slew_input)
+            pns_ok, peak_pns_val = self.pns_model.check_limits(pns_values_computed_ts)
+            pns_report = {
+                "status": "Checked",
+                "is_compliant": pns_ok,
+                "peak_total_normalized_pns": peak_pns_val,
+                # "pns_timeseries": pns_values_computed_ts, # Optionally return full timeseries
+                "thresholds_used": self.pns_model.pns_thresholds # Report thresholds from model
+            }
+        except Exception as e:
+            pns_ok = False # Fail safe
+            pns_report = {"status": "Error during PNS check", "error_message": str(e)}
+            print(f"Error during PNS check: {e}")
 
-        print(f"Constraint Verification: HW OK: {hw_ok}, PNS OK: {pns_ok}")
-        return hw_ok, pns_ok, {"hw_violations": hw_violations, "pns_report": pns_report}
+    # Combine per-axis and vector slew checks for overall hardware status
+    # The original hw_ok from _check_hardware_constraints now contains per-axis G and S plus vector S.
+    # We just need to correctly report it.
+    # The _check_hardware_constraints should return a more structured report.
+    # Let's assume _check_hardware_constraints returns dict like:
+    # {'G_ok': bool, 'S_axis_ok': bool, 'S_vec_ok': bool, 'violations': {...}}
+    # Then hw_ok would be all(G_ok, S_axis_ok, S_vec_ok)
+
+    # For now, verify_constraints will just pass through the hw_ok from _check_hardware_constraints,
+    # which needs to be updated to aggregate these checks.
+    # The 'hw_report' from _check_hardware_constraints now contains all hardware check details.
+
+    print(f"Constraint Verification: HW Overall OK: {overall_hw_status}, PNS OK: {pns_ok}")
+    return overall_hw_status, pns_ok, {"hw_report": hw_details_report, "pns_report": pns_report}
+
+
+    def calculate_gradient_duty_cycles(self, gradient_waveforms_dict_or_array,
+                                     active_threshold_factor=0.1):
+        """
+        Calculates the duty cycle for each gradient axis based on an activity threshold.
+        Duty cycle: Percentage of time gradient magnitude is >= active_threshold_factor * Gmax_axis.
+
+        Args:
+            gradient_waveforms_dict_or_array (dict or np.ndarray):
+                Gradient waveforms {'axis': waveform} or array (T, N_axes).
+            active_threshold_factor (float): Factor of Gmax above which gradient is "active".
+
+        Returns:
+            dict: {axis_name (str): duty_cycle_percent (float)}
+        """
+        if utils is None:
+            raise ImportError("girf.utils module not imported, cannot standardize trajectory format.")
+
+        # Standardize to dict format for easier per-axis Gmax handling
+        # Try to get number of axes for default_axis_names
+        num_axes = 1
+        if isinstance(gradient_waveforms_dict_or_array, dict):
+            num_axes = len(gradient_waveforms_dict_or_array)
+        elif hasattr(gradient_waveforms_dict_or_array, 'shape'):
+            num_axes = gradient_waveforms_dict_or_array.shape[1] if gradient_waveforms_dict_or_array.ndim > 1 else 1
+
+        default_names = ['x','y','z'][:num_axes] if num_axes <=3 else [f'axis_{i}' for i in range(num_axes)]
+
+        grad_waveforms_dict = utils.standardize_trajectory_format(
+            gradient_waveforms_dict_or_array, target_format='dict', default_axis_names=default_names
+        )
+
+        duty_cycles = {}
+        gmax_scalar = self.constraints.get('Gmax_T_per_m') # Overall Gmax
+
+        for axis, waveform in grad_waveforms_dict.items():
+            waveform = np.asarray(waveform)
+            if waveform.size == 0:
+                duty_cycles[axis] = 0.0
+                continue
+
+            # Determine Gmax for this specific axis.
+            # This is simplified: assumes either a per-axis Gmax_axis (e.g. Gmax_x) is in constraints,
+            # or falls back to the global Gmax_T_per_m. A more robust system might require explicit per-axis Gmax.
+            gmax_axis = self.constraints.get(f'Gmax_{axis}_T_per_m', gmax_scalar)
+            if gmax_axis is None: # Should not happen if Gmax_T_per_m has a default
+                 print(f"Warning: Gmax not defined for axis {axis} or globally. Skipping duty cycle calc for this axis.")
+                 duty_cycles[axis] = np.nan
+                 continue
+
+            threshold = active_threshold_factor * gmax_axis
+            active_time_points = np.sum(np.abs(waveform) >= threshold)
+            total_time_points = waveform.shape[0]
+            duty_cycle_percent = (active_time_points / total_time_points) * 100.0 if total_time_points > 0 else 0.0
+            duty_cycles[axis] = duty_cycle_percent
+
+        return duty_cycles
+
+    def check_thermal_limits_conceptual(self, gradient_waveforms_dict_or_array, dt_for_calc=None):
+        """
+        Conceptual check of thermal limits based on simplified duty cycle.
+        Requires 'thermal_limits': {axis: {'max_duty_cycle_percent': val}} in self.constraints.
+
+        Args:
+            gradient_waveforms_dict_or_array (dict or np.ndarray): Gradient waveforms.
+            dt_for_calc (float, optional): Time step. If None, uses self.dt.
+
+        Returns:
+            dict: {'thermal_ok': bool_overall, 'details': report_per_axis}
+        """
+        # dt is not directly used in this simplified duty cycle calc but kept for API consistency if RMS were used.
+        # The active_threshold_factor for duty cycle calculation is fixed internally for now.
+
+        thermal_limits_config = self.constraints.get('thermal_limits')
+        if not thermal_limits_config or not isinstance(thermal_limits_config, dict):
+            return {'thermal_ok': True, 'details': {}, 'message': 'No thermal_limits defined in constraints.'}
+
+        # Gmax values for each axis are needed for calculate_gradient_duty_cycles's threshold logic
+        # This part assumes Gmax is either globally defined or per-axis like Gmax_x, Gmax_y etc.
+        # For this conceptual check, calculate_gradient_duty_cycles will use self.constraints['Gmax_T_per_m'] if specific not found.
+
+        calculated_duty_cycles = self.calculate_gradient_duty_cycles(
+            gradient_waveforms_dict_or_array,
+            active_threshold_factor=self.constraints.get('thermal_duty_cycle_active_threshold_factor', 0.1)
+        )
+
+        all_axes_ok = True
+        report = {}
+
+        for axis, duty_cycle in calculated_duty_cycles.items():
+            if np.isnan(duty_cycle): # Gmax was not found for this axis
+                report[axis] = {'duty_cycle_percent': np.nan, 'limit_percent': np.nan,
+                                'is_ok': False, 'message': f'Could not calculate duty cycle for axis {axis} (Gmax missing?).'}
+                all_axes_ok = False
+                continue
+
+            axis_limit_info = thermal_limits_config.get(axis)
+            if axis_limit_info and 'max_duty_cycle_percent' in axis_limit_info:
+                limit = axis_limit_info['max_duty_cycle_percent']
+                is_ok = duty_cycle <= limit
+                report[axis] = {'duty_cycle_percent': duty_cycle, 'limit_percent': limit, 'is_ok': is_ok}
+                if not is_ok:
+                    all_axes_ok = False
+            else:
+                report[axis] = {'duty_cycle_percent': duty_cycle, 'limit_percent': None,
+                                'is_ok': True, 'message': f'No duty cycle limit defined for axis {axis}.'}
+
+        return {'thermal_ok': all_axes_ok, 'details': report}
 
 
 if __name__ == '__main__':
@@ -350,7 +512,19 @@ if __name__ == '__main__':
     constraints_config = {
         'Gmax_T_per_m': 0.040,          # 40 mT/m
         'Smax_T_per_m_per_s': 180,      # 180 T/m/s
-        'PNS_threshold_factor': 0.8     # Example: 80% of some model's limit
+        'Smax_vector_T_per_m_per_s': 200, # Vector Slew Max (e.g., for 3D trajectories)
+        'pns_model_thresholds': {       # Explicit thresholds for PNSModel
+            'rheobase_T_per_s': 20.0,
+            'chronaxie_ms': 0.36,
+            'max_total_pns_normalized': 0.8
+        },
+        'tolerance': 1e-7, # Tolerance for hardware constraint checks
+        'thermal_limits': { # New thermal limits section
+            'x': {'max_duty_cycle_percent': 60},
+            'y': {'max_duty_cycle_percent': 50},
+            'z': {'max_duty_cycle_percent': 45, 'some_other_thermal_param': 123} # Example other param
+        },
+        'thermal_duty_cycle_active_threshold_factor': 0.05 # 5% of Gmax to be "active"
     }
 
     # Dummy GIRF (e.g., identity for now, or simple attenuation)
@@ -383,21 +557,43 @@ if __name__ == '__main__':
 
         # 2. Verify constraints for the nominal (un-preemphasized) gradients
         print("\nVerifying constraints for NOMINAL gradients:")
+        # The nominal_gradients are stored as an array (T, Ndims)
         hw_ok_nom, pns_ok_nom, report_nom = planner.verify_constraints(nominal_gradients, pns_check=True)
         print(f"Nominal - HW OK: {hw_ok_nom}, PNS OK: {pns_ok_nom}")
-        if not hw_ok_nom: print(f"  HW Violations: {report_nom['hw_violations']}")
+        if not hw_ok_nom: print(f"  HW Report: {report_nom['hw_report']}")
         if not pns_ok_nom: print(f"  PNS Report: {report_nom['pns_report']}")
 
+        # 2b. Check thermal limits for nominal gradients
+        print("\nChecking conceptual thermal limits for NOMINAL gradients:")
+        # Need to pass gradients as dict for current duty cycle calc if Gmax is per axis from dict keys
+        nominal_gradients_dict = utils.standardize_trajectory_format(nominal_gradients, target_format='dict',
+                                                                    default_axis_names=['x','y','z'][:nominal_gradients.shape[1]])
+        thermal_report_nom = planner.check_thermal_limits_conceptual(nominal_gradients_dict)
+        print(f"Nominal - Thermal OK: {thermal_report_nom['thermal_ok']}")
+        for axis, details in thermal_report_nom.get('details', {}).items():
+            print(f"  Axis {axis}: Duty Cycle={details.get('duty_cycle_percent',0):.1f}%, Limit={details.get('limit_percent','N/A')}%, OK={details.get('is_ok')}")
+
+
         # 3. Apply pre-emphasis (simplified)
-        preemph_gradients = planner.apply_pre_emphasis() # Uses planner.nominal_gradients_time
+        preemph_gradients = planner.apply_pre_emphasis() # Uses planner.nominal_gradients_time (array)
         print(f"\nPre-emphasized gradients shape: {preemph_gradients.shape}")
 
         # 4. Verify constraints for the PRE-EMPHASIZED gradients
         print("\nVerifying constraints for PRE-EMPHASIZED gradients:")
         hw_ok_pre, pns_ok_pre, report_pre = planner.verify_constraints(preemph_gradients, pns_check=True)
         print(f"Pre-emphasized - HW OK: {hw_ok_pre}, PNS OK: {pns_ok_pre}")
-        if not hw_ok_pre: print(f"  HW Violations: {report_pre['hw_violations']}")
+        if not hw_ok_pre: print(f"  HW Report: {report_pre['hw_report']}")
         if not pns_ok_pre: print(f"  PNS Report: {report_pre['pns_report']}")
+
+        # 4b. Check thermal limits for pre-emphasized gradients
+        print("\nChecking conceptual thermal limits for PRE-EMPHASIZED gradients:")
+        preemph_gradients_dict = utils.standardize_trajectory_format(preemph_gradients, target_format='dict',
+                                                                    default_axis_names=['x','y','z'][:preemph_gradients.shape[1]])
+        thermal_report_pre = planner.check_thermal_limits_conceptual(preemph_gradients_dict)
+        print(f"Pre-emphasized - Thermal OK: {thermal_report_pre['thermal_ok']}")
+        for axis, details in thermal_report_pre.get('details', {}).items():
+            print(f"  Axis {axis}: Duty Cycle={details.get('duty_cycle_percent',0):.1f}%, Limit={details.get('limit_percent','N/A')}%, OK={details.get('is_ok')}")
+
 
         # 5. Convert pre-emphasized gradients back to k-space (final optimized trajectory)
         final_k_traj_optimized = planner._gradients_to_kspace(preemph_gradients)

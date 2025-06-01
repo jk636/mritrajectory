@@ -298,6 +298,51 @@ def absolute_value(x):
     return np.abs(np.asarray(x))
 
 
+def check_vector_slew_rate(slew_rates_array, smax_vector_T_per_m_per_s, tolerance=1e-9):
+    """
+    Checks if the vector magnitude of slew rates exceeds smax_vector.
+
+    Args:
+        slew_rates_array (np.ndarray): Slew rate waveforms (num_time_points, num_spatial_dims), units: T/m/s.
+                                       Requires num_spatial_dims > 1.
+        smax_vector_T_per_m_per_s (float): Maximum allowed vector magnitude of slew rate (T/m/s).
+        tolerance (float, optional): Tolerance for floating point comparison.
+
+    Returns:
+        tuple: (is_ok (bool), max_vector_sr_found (float), details (dict))
+    """
+    sr_array = _ensure_numpy_array(slew_rates_array, name="slew_rates_array")
+    if sr_array.ndim != 2 or sr_array.shape[1] <= 1:
+        # Vector slew rate is typically for 2D/3D. For 1D, it's same as per-axis.
+        # Return compliant or raise error, depending on desired behavior.
+        # For now, treat as compliant as per-axis check would handle 1D.
+        # Or, if it must be multi-axis:
+        # raise ValueError("slew_rates_array must be 2D with more than one spatial dimension for vector slew check.")
+        details = {
+            'message': "Vector slew rate check skipped or not applicable for 1D slew rates.",
+            'max_vector_sr_found_T_per_m_per_s': np.max(np.abs(sr_array)) if sr_array.size > 0 else 0.0,
+            'smax_vector_limit_T_per_m_per_s': float(smax_vector_T_per_m_per_s)
+        }
+        return True, (np.max(np.abs(sr_array)) if sr_array.size > 0 else 0.0), details
+
+
+    vector_slew_rate = np.sqrt(np.sum(sr_array**2, axis=1))
+    max_vector_sr_found_val = np.max(vector_slew_rate)
+
+    is_ok = max_vector_sr_found_val <= (smax_vector_T_per_m_per_s + tolerance)
+
+    details = {
+        'max_vector_sr_found_T_per_m_per_s': float(max_vector_sr_found_val),
+        'smax_vector_limit_T_per_m_per_s': float(smax_vector_T_per_m_per_s)
+    }
+    if not is_ok:
+        exceeding_time_idx = np.argmax(vector_slew_rate)
+        details['first_exceeding_time_idx'] = int(exceeding_time_idx)
+        details['first_exceeding_vector_value_T_per_m_per_s'] = float(vector_slew_rate[exceeding_time_idx])
+
+    return is_ok, float(max_vector_sr_found_val), details
+
+
 if __name__ == '__main__':
     print("--- Running girf.utils.py example simulations ---")
     dt_test = 4e-6  # 4 us
@@ -305,7 +350,7 @@ if __name__ == '__main__':
 
     # 1. Test standardize_trajectory_format
     print("\n1. Test standardize_trajectory_format:")
-    dict_traj = {'x': np.array([1,2,3]), 'y': np.array([4,5,6])}
+    dict_traj = {'x': np.array([1.,2.,3.]), 'y': np.array([4.,5.,6.])}
     array_from_dict = standardize_trajectory_format(dict_traj, target_format='array')
     print(f"  Dict to Array:\n{array_from_dict}")
     dict_from_array = standardize_trajectory_format(array_from_dict, target_format='dict', default_axis_names=['x','y'])
@@ -336,25 +381,36 @@ if __name__ == '__main__':
     # 3. Test Constraint Checkers
     print("\n3. Test Constraint Checkers:")
     gmax_limit = 0.05 # T/m
-    smax_limit = 200e6 # T/m/s (using large slew for this example grad)
+    smax_limit_axis = 200e6 # T/m/s (using large slew for this example grad)
+    smax_limit_vector = 250e6 # T/m/s
 
     # Create some gradient data (array format for simplicity in test)
-    test_grads_arr = np.array([[0.01, 0.02], [0.06, 0.03], [-0.04, 0.01]]) # T/m
+    test_grads_arr = np.array([[0.01, 0.02, 0.005], [0.06, 0.03, 0.01], [-0.04, 0.01, -0.01]]) # T/m
     test_slews_arr = compute_slew_rates(test_grads_arr, dt_test, output_format='array')
 
     ok_g, max_g, _ = check_gradient_strength(test_grads_arr, gmax_limit)
     print(f"  Grad check (limit {gmax_limit*1000} mT/m): OK={ok_g}, Max Found={max_g*1000:.1f} mT/m")
 
-    ok_sr, max_sr, _ = check_slew_rate(test_slews_arr, smax_limit)
-    print(f"  Slew check (limit {smax_limit/1e6} MT/m/s): OK={ok_sr}, Max Found={max_sr/1e6:.1f} MT/m/s")
+    ok_sr_axis, max_sr_axis, _ = check_slew_rate(test_slews_arr, smax_limit_axis)
+    print(f"  Per-axis Slew check (limit {smax_limit_axis/1e6:.0f} T/m/s): OK={ok_sr_axis}, Max Found={max_sr_axis/1e6:.1f} T/m/s")
+
+    ok_sr_vec, max_sr_vec, _ = check_vector_slew_rate(test_slews_arr, smax_limit_vector)
+    print(f"  Vector Slew check (limit {smax_limit_vector/1e6:.0f} T/m/s): OK={ok_sr_vec}, Max Found={max_sr_vec/1e6:.1f} T/m/s")
+
 
     # Test with exceeding values
     gmax_tight = 0.03 # T/m
-    smax_tight = 50e6  # T/m/s
+    smax_tight_axis = 50e6  # T/m/s
+    smax_tight_vector = 60e6 # T/m/s
+
     ok_g_fail, max_g_f, det_g = check_gradient_strength(test_grads_arr, gmax_tight)
     print(f"  Grad check (limit {gmax_tight*1000} mT/m): OK={ok_g_fail}, Max Found={max_g_f*1000:.1f} mT/m. Details: {det_g if not ok_g_fail else ''}")
-    ok_sr_fail, max_sr_f, det_sr = check_slew_rate(test_slews_arr, smax_tight)
-    print(f"  Slew check (limit {smax_tight/1e6} MT/m/s): OK={ok_sr_fail}, Max Found={max_sr_f/1e6:.1f} MT/m/s. Details: {det_sr if not ok_sr_fail else ''}")
+
+    ok_sr_axis_fail, max_sr_f_axis, det_sr_axis = check_slew_rate(test_slews_arr, smax_tight_axis)
+    print(f"  Per-axis Slew check (limit {smax_tight_axis/1e6:.0f} T/m/s): OK={ok_sr_axis_fail}, Max Found={max_sr_f_axis/1e6:.1f} T/m/s. Details: {det_sr_axis if not ok_sr_axis_fail else ''}")
+
+    ok_sr_vec_fail, max_sr_f_vec, det_sr_vec = check_vector_slew_rate(test_slews_arr, smax_tight_vector)
+    print(f"  Vector Slew check (limit {smax_tight_vector/1e6:.0f} T/m/s): OK={ok_sr_vec_fail}, Max Found={max_sr_f_vec/1e6:.1f} T/m/s. Details: {det_sr_vec if not ok_sr_vec_fail else ''}")
 
 
     # 4. Test Resampling

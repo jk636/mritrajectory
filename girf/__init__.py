@@ -10,6 +10,10 @@ from .pns import PNSModel
 from .pipeline import girf_trajectory_pipeline
 from . import utils
 from . import harmonics
+from . import timing
+from . import kspace_validation
+from . import sequence_checks
+from . import acoustic_noise
 
 __all__ = [
     "GIRFCalibrator",
@@ -20,5 +24,9 @@ __all__ = [
     "girf_trajectory_pipeline",
     "utils",
     "harmonics",
+    "timing",
+    "kspace_validation",
+    "sequence_checks",
+    "acoustic_noise",
     "__version__",
 ]
