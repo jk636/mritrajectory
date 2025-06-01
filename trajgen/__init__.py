@@ -23,9 +23,15 @@ from .trajectory import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
 from . import generators
 from . import utils
 from .kspace_generator import KSpaceTrajectoryGenerator
+from .sequence_base import MRISequence  # New
+from . import sequences  # New
 
 # For easier access to specific generator functions if desired by users
-from .generators import generate_spiral_trajectory, generate_radial_trajectory, generate_cones_trajectory, generate_epi_trajectory, generate_rosette_trajectory
+from .generators import (
+    generate_spiral_trajectory, generate_radial_trajectory,
+    generate_cones_trajectory, generate_epi_trajectory,
+    generate_rosette_trajectory, generate_tpi_trajectory  # New
+)
 
 # For easier access to specific utility functions if desired
 from .utils import constrain_trajectory, reconstruct_image, display_trajectory
@@ -35,14 +41,17 @@ __all__ = [
     'Trajectory',
     'COMMON_NUCLEI_GAMMA_HZ_PER_T',
     'KSpaceTrajectoryGenerator',
+    'MRISequence',  # New
+    'sequences',  # New
+    'generators', # Expose the modules themselves too
+    'utils',
     'generate_spiral_trajectory',
     'generate_radial_trajectory',
     'generate_cones_trajectory',
     'generate_epi_trajectory',
-    'generate_rosette_trajectory', # Added
+    'generate_rosette_trajectory',
+    'generate_tpi_trajectory',  # New
     'constrain_trajectory',
     'reconstruct_image',
     'display_trajectory',
-    'generators', # Expose the modules themselves too
-    'utils'
 ]

@@ -63,7 +63,8 @@ class Trajectory:
                  metadata: Optional[Dict[str, Any]] = None,
                  gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
                  dead_time_start_seconds: float = 0.0,
-                 dead_time_end_seconds: float = 0.0):
+                 dead_time_end_seconds: float = 0.0,
+                 sequence_params: Optional[Dict[str, Any]] = None):
         """
         Initializes a Trajectory object.
 
@@ -80,8 +81,10 @@ class Trajectory:
             gamma_Hz_per_T (float): Gyromagnetic ratio (Hz/T). Defaults to '1H'.
             dead_time_start_seconds (float): Dead time before k-space acquisition (s).
             dead_time_end_seconds (float): Dead time after k-space acquisition (s).
+            sequence_params (Optional[Dict[str, Any]]): Dictionary of sequence parameters.
         """
         self.name = name
+        self.sequence_params = sequence_params or {}
         _kspace_input_arr = np.array(kspace_points_rad_per_m)
         _kspace_points_oriented = _kspace_input_arr
         k_was_transposed = False
@@ -658,6 +661,59 @@ class Trajectory:
         ax.set_title(final_plot_title)
         ax.axis('equal')
         return ax
+
+    # Placeholder methods for future enhancements
+    def check_gradient_limits(self, system_limits: dict) -> bool:
+        """
+        Checks if the trajectory's gradient waveforms and slew rates are within
+        the specified system limits.
+
+        Args:
+            system_limits (dict): A dictionary containing system limits,
+                                  e.g., {'max_grad': 0.04, 'max_slew': 150}.
+
+        Returns:
+            bool: True if within limits, False otherwise.
+        """
+        raise NotImplementedError("check_gradient_limits is not yet implemented.")
+
+    def assess_kspace_coverage(self) -> str:
+        """
+        Provides a qualitative assessment of k-space coverage.
+
+        Returns:
+            str: A string describing the k-space coverage (e.g., "Uniform",
+                 "Center-weighted", "Sparse").
+        """
+        raise NotImplementedError("assess_kspace_coverage is not yet implemented.")
+
+    def estimate_off_resonance_sensitivity(self) -> str:
+        """
+        Estimates the trajectory's sensitivity to off-resonance effects.
+
+        Returns:
+            str: A string describing the sensitivity (e.g., "Low", "Medium", "High").
+        """
+        raise NotImplementedError("estimate_off_resonance_sensitivity is not yet implemented.")
+
+    def assess_motion_robustness(self) -> str:
+        """
+        Assesses the trajectory's robustness to subject motion.
+
+        Returns:
+            str: A string describing the motion robustness (e.g., "High", "Medium", "Low").
+        """
+        raise NotImplementedError("assess_motion_robustness is not yet implemented.")
+
+    def suggest_reconstruction_method(self) -> str:
+        """
+        Suggests a suitable reconstruction method based on trajectory properties.
+
+        Returns:
+            str: A string suggesting a reconstruction method (e.g., "NUFFT",
+                 "Iterative SENSE", "Compressed Sensing").
+        """
+        raise NotImplementedError("suggest_reconstruction_method is not yet implemented.")
 
     def plot_voronoi(self, title: Optional[str] = None,
                      ax: Optional[plt.Axes] = None,

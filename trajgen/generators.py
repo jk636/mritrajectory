@@ -19,8 +19,126 @@ __all__ = [
     'generate_radial_trajectory',
     'generate_cones_trajectory',
     'generate_epi_trajectory',
-    'generate_rosette_trajectory'
+    'generate_rosette_trajectory',
+    'generate_tpi_trajectory'
 ]
+
+# Existing imports:
+# import numpy as np
+# from typing import Tuple, Union, Optional
+# from .trajectory import COMMON_NUCLEI_GAMMA_HZ_PER_T
+
+
+def generate_tpi_trajectory(
+    fov_mm: Union[float, Tuple[float, float, float]],
+    resolution_mm: Union[float, Tuple[float, float, float]],
+    num_twists: int,
+    points_per_segment: int,
+    cone_angle_deg: float,
+    spiral_turns_per_twist: float,
+    undersampling_factor: float = 1.0, # Placeholder, not directly used in this basic TPI
+    gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']
+) -> np.ndarray:
+    """
+    Generates a 3D Twisted Projection Imaging (TPI) k-space trajectory.
+
+    TPI involves tracing spiral paths on the surface of cones, where the cones
+    themselves are distributed azimuthally.
+
+    Parameters:
+    - fov_mm: Field of view in mm (e.g., 256 or (256,256,256)).
+    - resolution_mm: Resolution in mm (e.g., 1.0 or (1.0,1.0,1.0)).
+    - num_twists (int): Number of twisted projection arms/segments.
+    - points_per_segment (int): Number of k-space points along each twisted segment.
+    - cone_angle_deg (float): Angle of the cone (half-angle) w.r.t. kz-axis (0 to 90 degrees).
+                              0 degrees is a line along kz, 90 degrees is a 2D spiral in kx-ky.
+    - spiral_turns_per_twist (float): Number of spiral turns along one projection/twist on the cone surface.
+    - undersampling_factor (float): Overall undersampling factor (currently a placeholder).
+    - gamma_Hz_per_T (float): Gyromagnetic ratio.
+
+    Returns:
+    - np.ndarray: K-space points of shape (3, num_twists * points_per_segment) in rad/m.
+    """
+    num_dimensions = 3 # TPI is inherently 3D
+
+    if isinstance(fov_mm, (int, float)):
+        fov_mm_tuple: Tuple[float, ...] = tuple([float(fov_mm)] * num_dimensions)
+    elif isinstance(fov_mm, (tuple, list)) and len(fov_mm) == num_dimensions:
+        fov_mm_tuple = tuple(map(float, fov_mm))
+    else:
+        raise ValueError(f"fov_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if isinstance(resolution_mm, (int, float)):
+        resolution_mm_tuple: Tuple[float, ...] = tuple([float(resolution_mm)] * num_dimensions)
+    elif isinstance(resolution_mm, (tuple, list)) and len(resolution_mm) == num_dimensions:
+        resolution_mm_tuple = tuple(map(float, resolution_mm))
+    else:
+        raise ValueError(f"resolution_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if not (0 <= cone_angle_deg <= 90):
+        raise ValueError("cone_angle_deg must be between 0 and 90 degrees.")
+    if num_twists <= 0 or points_per_segment <= 0:
+        raise ValueError("num_twists and points_per_segment must be positive.")
+    if spiral_turns_per_twist <= 0:
+        raise ValueError("spiral_turns_per_twist must be positive.")
+
+    resolution_m = np.array(resolution_mm_tuple) / 1000.0
+    # Use the minimum resolution (largest k_max) to define the overall extent
+    k_max_rad_per_m = np.min(1.0 / (2.0 * resolution_m))
+
+    all_k_points_list = []
+
+    # Golden angle increment for distributing twists azimuthally
+    golden_angle_increment_rad = np.pi * (3.0 - np.sqrt(5.0))
+
+    for i_twist in range(num_twists):
+        twist_azimuth_rad = (i_twist * golden_angle_increment_rad) % (2 * np.pi)
+
+        # The spiral radius extends along the surface of the cone.
+        # k_max_rad_per_m is the maximum extent from the origin.
+        # The length of the spiral path on the cone surface can go up to k_max_rad_per_m.
+        if points_per_segment == 1:
+            k_spiral_radius_on_surface = np.array([k_max_rad_per_m])
+        else:
+            k_spiral_radius_on_surface = np.linspace(0, k_max_rad_per_m, points_per_segment, endpoint=True)
+
+        # Angle for the spiral path on the unfolded cone surface
+        phi_spiral = np.linspace(0, spiral_turns_per_twist * 2 * np.pi, points_per_segment, endpoint=False if points_per_segment > 1 else True)
+
+        # Map spiral points to the cone surface (local coordinates before twist rotation)
+        cos_cone_angle = np.cos(np.deg2rad(cone_angle_deg))
+        sin_cone_angle = np.sin(np.deg2rad(cone_angle_deg))
+
+        kz_local = k_spiral_radius_on_surface * cos_cone_angle
+        k_xy_plane_radius_local = k_spiral_radius_on_surface * sin_cone_angle
+
+        kx_cone = k_xy_plane_radius_local * np.cos(phi_spiral)
+        ky_cone = k_xy_plane_radius_local * np.sin(phi_spiral)
+
+        # Rotate this segment by the twist's azimuthal angle around the main Z-axis
+        cos_twist_az = np.cos(twist_azimuth_rad)
+        sin_twist_az = np.sin(twist_azimuth_rad)
+
+        kx_final = kx_cone * cos_twist_az - ky_cone * sin_twist_az
+        ky_final = kx_cone * sin_twist_az + ky_cone * cos_twist_az
+        kz_final = kz_local # kz is invariant under Z-axis rotation
+
+        segment_k_points = np.vstack((kx_final, ky_final, kz_final)) # Shape (3, points_per_segment)
+        all_k_points_list.append(segment_k_points)
+
+    if not all_k_points_list:
+        return np.zeros((3, 0))
+
+    # Concatenate points from all twists
+    final_k_points = np.concatenate(all_k_points_list, axis=1) # Shape (3, num_twists * points_per_segment)
+
+    # Note: Undersampling factor is not explicitly used here yet,
+    # it could modify num_twists or points_per_segment before generation,
+    # or affect spiral density (turns) which is implicitly handled by spiral_turns_per_twist.
+    # For this basic version, it's a placeholder.
+
+    return final_k_points
+
 
 def generate_spiral_trajectory(
     fov_mm,
