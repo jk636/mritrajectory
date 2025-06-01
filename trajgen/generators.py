@@ -22,13 +22,158 @@ __all__ = [
     'generate_rosette_trajectory',
     'generate_tpi_trajectory',
     'generate_propeller_blade_trajectory',
-    'generate_wave_caipi_trajectory' # New
+    'generate_wave_caipi_trajectory',
+    'generate_drunken_spiral_trajectory' # New
 ]
 
 # Existing imports:
 # import numpy as np
 # from typing import Tuple, Union, Optional
 # from .trajectory import COMMON_NUCLEI_GAMMA_HZ_PER_T
+
+
+def generate_drunken_spiral_trajectory(
+    fov_mm: Union[float, Tuple[float, float]],
+    resolution_mm: Union[float, Tuple[float, float]],
+    num_points: int,
+    dt_seconds: float,
+    base_spiral_turns: float = 5.0,
+    perturbation_amplitude_factor: float = 0.1, # Relative to k_max scaled by sqrt(num_points)
+    density_sigma_factor: float = 0.25, # Sigma for Gaussian decay of noise weight, relative to k_max
+    max_grad_Tm_per_m: Optional[float] = None,
+    max_slew_Tm_per_s_per_m: Optional[float] = None, # Note: Slew here is T/m/s/m, not T/m/s (as in Trajectory class)
+                                                # For consistency, let's assume this will be T/m/s
+    gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
+    num_smoothing_iterations: int = 3,
+    smoothing_kernel_size: int = 5
+) -> np.ndarray:
+    """
+    Generates a 2D "drunken" spiral k-space trajectory.
+
+    This trajectory starts with a base spiral and adds weighted random perturbations.
+    It then iteratively attempts to smooth the trajectory to meet optional
+    gradient and slew rate constraints.
+
+    Parameters:
+    - fov_mm: Field of view in mm.
+    - resolution_mm: Desired resolution in mm.
+    - num_points (int): Total number of k-space points for the trajectory.
+    - dt_seconds (float): Dwell time (time between k-space samples) in seconds.
+    - base_spiral_turns (float): Number of turns for the underlying Archimedean spiral.
+    - perturbation_amplitude_factor (float): Factor scaling the random noise amplitude.
+                                           The actual perturbation scale is relative to k_max/sqrt(num_points).
+    - density_sigma_factor (float): Sigma for the Gaussian weighting of noise,
+                                    relative to k_max. Noise is stronger at k-space center.
+    - max_grad_Tm_per_m (Optional[float]): Maximum gradient amplitude constraint (T/m).
+    - max_slew_Tm_per_s_per_m (Optional[float]): Maximum slew rate constraint (T/m/s).
+                                               (Prompt used T/m/s/m, but T/m/s is more standard for slew).
+                                               This implementation will assume T/m/s for this variable.
+    - gamma_Hz_per_T (float): Gyromagnetic ratio.
+    - num_smoothing_iterations (int): Number of iterations to apply smoothing if constraints are violated.
+    - smoothing_kernel_size (int): Size of the moving average filter kernel for smoothing. Must be odd.
+
+    Returns:
+    - np.ndarray: K-space points of shape (2, num_points) in rad/m.
+    """
+    num_dimensions = 2
+
+    if num_points <= 0:
+        raise ValueError("num_points must be positive.")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be positive.")
+    if smoothing_kernel_size <= 0 or smoothing_kernel_size % 2 == 0:
+        raise ValueError("smoothing_kernel_size must be positive and odd.")
+
+    if isinstance(fov_mm, (int, float)):
+        fov_mm_tuple: Tuple[float, ...] = (float(fov_mm), float(fov_mm))
+    elif isinstance(fov_mm, (tuple, list)) and len(fov_mm) == num_dimensions:
+        fov_mm_tuple = tuple(map(float, fov_mm))
+    else:
+        raise ValueError(f"fov_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    if isinstance(resolution_mm, (int, float)):
+        resolution_mm_tuple: Tuple[float, ...] = (float(resolution_mm), float(resolution_mm))
+    elif isinstance(resolution_mm, (tuple, list)) and len(resolution_mm) == num_dimensions:
+        resolution_mm_tuple = tuple(map(float, resolution_mm))
+    else:
+        raise ValueError(f"resolution_mm must be a number or a tuple/list of length {num_dimensions}.")
+
+    resolution_m = np.array(resolution_mm_tuple) / 1000.0
+    k_max_rad_per_m = np.min(1.0 / (2.0 * resolution_m))
+
+    # Base Spiral
+    r_base = np.linspace(0, k_max_rad_per_m, num_points, endpoint=True)
+    theta_base = np.linspace(0, base_spiral_turns * 2 * np.pi, num_points, endpoint=True)
+
+    # Noise Generation
+    noise_kx = np.random.normal(0, 1, num_points)
+    noise_ky = np.random.normal(0, 1, num_points)
+
+    # Density Weighting for Noise
+    radial_distance_normalized_sq = (r_base / (k_max_rad_per_m + 1e-9))**2
+    weight = np.exp(-radial_distance_normalized_sq / (density_sigma_factor**2 + 1e-9))
+
+    # Perturbation Scaling
+    perturb_scale = perturbation_amplitude_factor * (k_max_rad_per_m / (np.sqrt(num_points) + 1e-9))
+
+    # Apply Perturbation
+    kx_perturbed = r_base * np.cos(theta_base) + weight * noise_kx * perturb_scale
+    ky_perturbed = r_base * np.sin(theta_base) + weight * noise_ky * perturb_scale
+
+    k_points = np.vstack((kx_perturbed, ky_perturbed)) # Shape (2, num_points)
+
+    if num_points == 1: # No gradients or slew for a single point
+        return k_points
+
+    # Iterative Constraint Application & Smoothing
+    for i_iter in range(num_smoothing_iterations):
+        if k_points.shape[1] < 2 : # Need at least 2 points for gradient/slew
+             break
+
+        gradients = np.gradient(k_points, dt_seconds, axis=1) / gamma_Hz_per_T
+
+        # Slew rate calculation: np.diff results in N-1 points. Pad to N for norm calculation.
+        if k_points.shape[1] > 1:
+            slew_rates_diff = np.diff(gradients, axis=1) / dt_seconds
+             # Pad the last slew rate to maintain shape, or use np.gradient for slew too
+            slew_rates = np.pad(slew_rates_diff, ((0,0),(0,1)), mode='edge') # Pad with edge value
+        else:
+            slew_rates = np.zeros_like(gradients)
+
+
+        grad_norm = np.linalg.norm(gradients, axis=0)
+        slew_norm = np.linalg.norm(slew_rates, axis=0)
+
+        max_achieved_grad = np.max(grad_norm) if grad_norm.size > 0 else 0
+        max_achieved_slew = np.max(slew_norm) if slew_norm.size > 0 else 0
+
+        grad_ok = (max_grad_Tm_per_m is None) or (max_achieved_grad <= max_grad_Tm_per_m)
+        # Assuming max_slew_Tm_per_s_per_m is actually T/m/s for this variable name
+        slew_ok = (max_slew_Tm_per_s_per_m is None) or (max_achieved_slew <= max_slew_Tm_per_s_per_m)
+
+        if grad_ok and slew_ok:
+            print(f"Drunken spiral: Constraints met at iteration {i_iter+1}.")
+            break
+
+        if i_iter < num_smoothing_iterations -1 : # Don't smooth on the last iteration if still not met
+            if k_points.shape[1] >= smoothing_kernel_size : # Ensure enough points for convolution
+                smoothing_filter = np.ones(smoothing_kernel_size) / smoothing_kernel_size
+                k_points[0,:] = np.convolve(k_points[0,:], smoothing_filter, mode='same')
+                k_points[1,:] = np.convolve(k_points[1,:], smoothing_filter, mode='same')
+            else:
+                # Not enough points to smooth with this kernel, maybe break or use smaller kernel?
+                print(f"Drunken spiral: Not enough points ({k_points.shape[1]}) for smoothing kernel size {smoothing_kernel_size} at iter {i_iter+1}. Stopping smoothing.")
+                break
+
+        if i_iter == num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
+            warning_msg = "Drunken spiral: Constraints not fully met after smoothing iterations."
+            if not grad_ok and max_grad_Tm_per_m is not None:
+                warning_msg += f" Max grad: {max_achieved_grad:.2f} T/m (Limit: {max_grad_Tm_per_m:.2f} T/m)."
+            if not slew_ok and max_slew_Tm_per_s_per_m is not None:
+                warning_msg += f" Max slew: {max_achieved_slew:.2f} T/m/s (Limit: {max_slew_Tm_per_s_per_m:.2f} T/m/s)."
+            print(warning_msg)
+
+    return k_points
 
 
 def generate_tpi_trajectory(

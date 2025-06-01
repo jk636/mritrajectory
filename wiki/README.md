@@ -12,9 +12,9 @@ This wiki provides examples and explanations for various features, including:
 - [Variable Density Spiral Sequence](./variable_density_spiral.md)
 - [Radial Sequence](./radial_sequence.md)
 - [Twisted Projection Imaging (TPI) Sequence](./tpi_sequence.md)
-- [2D-to-3D Stacking Utility (Stack-of-Stars)](./stack_2d_to_3d_utility.md)
-- [3D Rotation Utility](./rotate_3d_utility.md)
 - [PROPELLER/BLADE Sequence](./propeller_blade_sequence.md)
 - [Wave-CAIPI Sequence](./wave_caipi_sequence.md)
-
+- [Drunken Spiral Trajectory](./drunken_spiral.md)
+- [2D-to-3D Stacking Utility (Stack-of-Stars)](./stack_2d_to_3d_utility.md)
+- [3D Rotation Utility](./rotate_3d_utility.md)
 Please refer to the specific Markdown files for detailed examples.
