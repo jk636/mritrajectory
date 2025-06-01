@@ -46,7 +46,8 @@ def generate_drunken_spiral_trajectory(
                                                 # For consistency, let's assume this will be T/m/s
     gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
     num_smoothing_iterations: int = 3,
-    smoothing_kernel_size: int = 5
+    smoothing_kernel_size: int = 5,
+    smoothness_emphasis_factor: Optional[float] = None
 ) -> np.ndarray:
     """
     Generates a 2D "drunken" spiral k-space trajectory.
@@ -72,6 +73,9 @@ def generate_drunken_spiral_trajectory(
     - gamma_Hz_per_T (float): Gyromagnetic ratio.
     - num_smoothing_iterations (int): Number of iterations to apply smoothing if constraints are violated.
     - smoothing_kernel_size (int): Size of the moving average filter kernel for smoothing. Must be odd.
+    - smoothness_emphasis_factor (Optional[float]): Factor [0,1] to emphasize smoothness.
+                                                   0 = original perturbation/smoothing.
+                                                   1 = minimal perturbation & maximal smoothing.
 
     Returns:
     - np.ndarray: K-space points of shape (2, num_points) in rad/m.
@@ -114,8 +118,29 @@ def generate_drunken_spiral_trajectory(
     radial_distance_normalized_sq = (r_base / (k_max_rad_per_m + 1e-9))**2
     weight = np.exp(-radial_distance_normalized_sq / (density_sigma_factor**2 + 1e-9))
 
+    # Initialize current perturbation and smoothing based on inputs
+    current_perturbation_amplitude_factor = perturbation_amplitude_factor
+    current_num_smoothing_iterations = num_smoothing_iterations
+
+    if smoothness_emphasis_factor is not None:
+        if 0.0 <= smoothness_emphasis_factor <= 1.0:
+            min_perturb_factor = 0.01 # Minimal perturbation (e.g., 1% of original)
+            current_perturbation_amplitude_factor = perturbation_amplitude_factor * (1.0 - smoothness_emphasis_factor) + \
+                                                    (perturbation_amplitude_factor * min_perturb_factor) * smoothness_emphasis_factor
+
+            max_additional_smoothing_iters = 10 # Max additional smoothing iterations
+            current_num_smoothing_iterations = int(np.round(
+                num_smoothing_iterations * (1.0 - smoothness_emphasis_factor) + \
+                (num_smoothing_iterations + max_additional_smoothing_iters) * smoothness_emphasis_factor
+            ))
+            print(f"Drunken Spiral: Smoothness factor {smoothness_emphasis_factor:.2f} applied. "
+                  f"Perturbation factor: {current_perturbation_amplitude_factor:.4f}, "
+                  f"Smoothing iterations: {current_num_smoothing_iterations}")
+        else:
+            print(f"Warning: smoothness_emphasis_factor ({smoothness_emphasis_factor}) is out of [0,1] range and will be ignored.")
+
     # Perturbation Scaling
-    perturb_scale = perturbation_amplitude_factor * (k_max_rad_per_m / (np.sqrt(num_points) + 1e-9))
+    perturb_scale = current_perturbation_amplitude_factor * (k_max_rad_per_m / (np.sqrt(num_points) + 1e-9))
 
     # Apply Perturbation
     kx_perturbed = r_base * np.cos(theta_base) + weight * noise_kx * perturb_scale
@@ -127,7 +152,7 @@ def generate_drunken_spiral_trajectory(
         return k_points
 
     # Iterative Constraint Application & Smoothing
-    for i_iter in range(num_smoothing_iterations):
+    for i_iter in range(current_num_smoothing_iterations): # Use potentially modified iteration count
         if k_points.shape[1] < 2 : # Need at least 2 points for gradient/slew
              break
 
@@ -156,7 +181,7 @@ def generate_drunken_spiral_trajectory(
             print(f"Drunken spiral: Constraints met at iteration {i_iter+1}.")
             break
 
-        if i_iter < num_smoothing_iterations -1 : # Don't smooth on the last iteration if still not met
+        if i_iter < current_num_smoothing_iterations -1 : # Don't smooth on the last iteration if still not met
             if k_points.shape[1] >= smoothing_kernel_size : # Ensure enough points for convolution
                 smoothing_filter = np.ones(smoothing_kernel_size) / smoothing_kernel_size
                 k_points[0,:] = np.convolve(k_points[0,:], smoothing_filter, mode='same')
@@ -166,7 +191,7 @@ def generate_drunken_spiral_trajectory(
                 print(f"Drunken spiral: Not enough points ({k_points.shape[1]}) for smoothing kernel size {smoothing_kernel_size} at iter {i_iter+1}. Stopping smoothing.")
                 break
 
-        if i_iter == num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
+        if i_iter == current_num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
             warning_msg = "Drunken spiral: Constraints not fully met after smoothing iterations."
             if not grad_ok and max_grad_Tm_per_m is not None:
                 warning_msg += f" Max grad: {max_achieved_grad:.2f} T/m (Limit: {max_grad_Tm_per_m:.2f} T/m)."
@@ -189,7 +214,8 @@ def generate_drunken_kooshball_trajectory(
     max_slew_Tm_per_s_per_m: Optional[float] = None, # Assuming T/m/s
     gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
     num_smoothing_iterations: int = 3,
-    smoothing_kernel_size: int = 5
+    smoothing_kernel_size: int = 5,
+    smoothness_emphasis_factor: Optional[float] = None
 ) -> np.ndarray:
     """
     Generates a 3D "drunken kooshball" k-space trajectory.
@@ -214,6 +240,7 @@ def generate_drunken_kooshball_trajectory(
     - gamma_Hz_per_T (float): Gyromagnetic ratio.
     - num_smoothing_iterations (int): Iterations for smoothing if constraints are violated.
     - smoothing_kernel_size (int): Kernel size for smoothing (must be odd).
+    - smoothness_emphasis_factor (Optional[float]): Factor [0,1] to emphasize smoothness.
 
     Returns:
     - np.ndarray: K-space points of shape (3, num_points) in rad/m.
@@ -266,8 +293,29 @@ def generate_drunken_kooshball_trajectory(
     radial_distance_normalized_sq = (r_base / (k_max_rad_per_m + 1e-9))**2
     weight = np.exp(-radial_distance_normalized_sq / (density_sigma_factor**2 + 1e-9)) # Weight is (N,)
 
+    # Initialize current perturbation and smoothing based on inputs
+    current_perturbation_amplitude_factor = perturbation_amplitude_factor
+    current_num_smoothing_iterations = num_smoothing_iterations
+
+    if smoothness_emphasis_factor is not None:
+        if 0.0 <= smoothness_emphasis_factor <= 1.0:
+            min_perturb_factor = 0.01
+            current_perturbation_amplitude_factor = perturbation_amplitude_factor * (1.0 - smoothness_emphasis_factor) + \
+                                                    (perturbation_amplitude_factor * min_perturb_factor) * smoothness_emphasis_factor
+
+            max_additional_smoothing_iters = 10
+            current_num_smoothing_iterations = int(np.round(
+                num_smoothing_iterations * (1.0 - smoothness_emphasis_factor) + \
+                (num_smoothing_iterations + max_additional_smoothing_iters) * smoothness_emphasis_factor
+            ))
+            print(f"Drunken Kooshball: Smoothness factor {smoothness_emphasis_factor:.2f} applied. "
+                  f"Perturbation factor: {current_perturbation_amplitude_factor:.4f}, "
+                  f"Smoothing iterations: {current_num_smoothing_iterations}")
+        else:
+            print(f"Warning: smoothness_emphasis_factor ({smoothness_emphasis_factor}) is out of [0,1] range and will be ignored.")
+
     # Perturbation Scaling
-    perturb_scale = perturbation_amplitude_factor * (k_max_rad_per_m / (np.cbrt(num_points) + 1e-9))
+    perturb_scale = current_perturbation_amplitude_factor * (k_max_rad_per_m / (np.cbrt(num_points) + 1e-9))
 
     # Apply Perturbation (element-wise for noise, broadcast weight and perturb_scale)
     k_perturbed = base_k_points + weight * noise_k * perturb_scale # (3,N) + (N,)*(3,N)*(scalar) -> (3,N)
@@ -276,7 +324,7 @@ def generate_drunken_kooshball_trajectory(
         return k_perturbed
 
     # Iterative Constraint Application & Smoothing
-    for i_iter in range(num_smoothing_iterations):
+    for i_iter in range(current_num_smoothing_iterations): # Use potentially modified iteration count
         if k_perturbed.shape[1] < 2: break
 
         gradients = np.gradient(k_perturbed, dt_seconds, axis=1) / gamma_Hz_per_T
@@ -300,7 +348,7 @@ def generate_drunken_kooshball_trajectory(
             print(f"Drunken Kooshball: Constraints met at iteration {i_iter+1}.")
             break
 
-        if i_iter < num_smoothing_iterations - 1:
+        if i_iter < current_num_smoothing_iterations - 1:
             if k_perturbed.shape[1] >= smoothing_kernel_size:
                 smoothing_filter = np.ones(smoothing_kernel_size) / smoothing_kernel_size
                 for dim_idx in range(num_dimensions):
@@ -309,7 +357,7 @@ def generate_drunken_kooshball_trajectory(
                 print(f"Drunken Kooshball: Not enough points ({k_perturbed.shape[1]}) for smoothing kernel size {smoothing_kernel_size} at iter {i_iter+1}. Stopping smoothing.")
                 break
 
-        if i_iter == num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
+        if i_iter == current_num_smoothing_iterations - 1 and not (grad_ok and slew_ok):
             warning_msg = "Drunken Kooshball: Constraints not fully met after smoothing iterations."
             if not grad_ok and max_grad_Tm_per_m is not None:
                 warning_msg += f" Max grad: {max_achieved_grad:.2f} T/m (Limit: {max_grad_Tm_per_m:.2f} T/m)."

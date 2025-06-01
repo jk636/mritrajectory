@@ -34,7 +34,8 @@ params = {
     'max_grad_Tm_per_m': 0.035,  # T/m
     'max_slew_Tm_per_s_per_m': 120.0, # T/m/s
     'num_smoothing_iterations': 5,
-    'smoothing_kernel_size': 5
+    'smoothing_kernel_size': 5,
+    'smoothness_emphasis_factor': 0.8 # Emphasize smoothness: less perturbation, more smoothing
 }
 
 # Create the sequence
@@ -90,7 +91,8 @@ print(f"Actual max slew rate: {drunken_spiral_seq.get_max_slew_Tm_per_s():.1f} T
 -   `density_sigma_factor`: Sigma for the Gaussian weighting of noise, relative to `k_max`. Noise is stronger at k-space center where `r_base/k_max` is small.
 -   `max_grad_Tm_per_m` (Optional): Target maximum gradient amplitude constraint (T/m) for the generator's iterative smoothing.
 -   `max_slew_Tm_per_s_per_m` (Optional): Target maximum slew rate constraint (T/m/s) for the generator's iterative smoothing.
--   `num_smoothing_iterations`: Number of iterations to apply smoothing if constraints (passed to generator) are violated.
+-   `num_smoothing_iterations`: Base number of iterations to apply smoothing if constraints (passed to generator) are violated.
 -   `smoothing_kernel_size`: Size of the moving average filter kernel for smoothing (should be odd).
+-   `smoothness_emphasis_factor: Optional[float] = None` (Range: 0.0 to 1.0, default: None). If provided, this factor adjusts the `perturbation_amplitude_factor` (linearly decreasing it towards a minimal value as factor approaches 1.0) and `num_smoothing_iterations` (linearly increasing it up to a maximum additional count as factor approaches 1.0). A value of 0.0 uses the explicitly provided perturbation and iterations, while 1.0 maximizes the smoothing effect by minimizing perturbation and maximizing smoothing iterations. If `None`, no adjustment is made.
 
 ```

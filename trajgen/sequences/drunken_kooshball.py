@@ -36,6 +36,7 @@ class DrunkenKooshballSequence(MRISequence):
                  max_slew_Tm_per_s_per_m: Optional[float] = None, # Target for generator (T/m/s)
                  num_smoothing_iterations: int = 3,
                  smoothing_kernel_size: int = 5,
+                 smoothness_emphasis_factor: Optional[float] = None, # New
                  # Other MRISequence parameters
                  gamma_Hz_per_T: float = COMMON_NUCLEI_GAMMA_HZ_PER_T['1H'],
                  dead_time_start_seconds: float = 0.0,
@@ -57,6 +58,7 @@ class DrunkenKooshballSequence(MRISequence):
             max_slew_Tm_per_s_per_m (Optional[float]): Target maximum slew rate for generator (T/m/s).
             num_smoothing_iterations (int): Iterations for smoothing in generator.
             smoothing_kernel_size (int): Kernel size for smoothing in generator.
+            smoothness_emphasis_factor (Optional[float]): Factor [0,1] to emphasize smoothness.
             gamma_Hz_per_T (float): Gyromagnetic ratio.
             dead_time_start_seconds (float): Dead time at sequence start.
             dead_time_end_seconds (float): Dead time at sequence end.
@@ -70,6 +72,7 @@ class DrunkenKooshballSequence(MRISequence):
         self.gen_max_slew_Tm_per_s_per_m = max_slew_Tm_per_s_per_m
         self.num_smoothing_iterations = num_smoothing_iterations
         self.smoothing_kernel_size = smoothing_kernel_size
+        self.smoothness_emphasis_factor = smoothness_emphasis_factor # New
 
         sequence_specific_params = {
             'num_points': num_points,
@@ -80,6 +83,7 @@ class DrunkenKooshballSequence(MRISequence):
             'max_slew_Tm_per_s_per_m_target': max_slew_Tm_per_s_per_m,
             'num_smoothing_iterations': num_smoothing_iterations,
             'smoothing_kernel_size': smoothing_kernel_size,
+            'smoothness_emphasis_factor': smoothness_emphasis_factor, # New
         }
 
         num_dimensions = 3 # Drunken Kooshball is 3D
@@ -114,7 +118,8 @@ class DrunkenKooshballSequence(MRISequence):
             max_slew_Tm_per_s_per_m=self.gen_max_slew_Tm_per_s_per_m,
             gamma_Hz_per_T=self.metadata.get('gamma_Hz_per_T', COMMON_NUCLEI_GAMMA_HZ_PER_T['1H']),
             num_smoothing_iterations=self.num_smoothing_iterations,
-            smoothing_kernel_size=self.smoothing_kernel_size
+            smoothing_kernel_size=self.smoothing_kernel_size,
+            smoothness_emphasis_factor=self.smoothness_emphasis_factor # New
         )
         return kspace_points_D_N
 

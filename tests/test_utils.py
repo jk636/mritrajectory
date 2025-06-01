@@ -11,10 +11,109 @@ from trajgen.trajectory import Trajectory, COMMON_NUCLEI_GAMMA_HZ_PER_T
 from trajgen.generators import generate_radial_trajectory, generate_spiral_trajectory # Keep if TestConstrain uses it
 from trajgen.utils import (
     constrain_trajectory, reconstruct_image, display_trajectory,
-    stack_2d_trajectory_to_3d, rotate_3d_trajectory
+    stack_2d_trajectory_to_3d, rotate_3d_trajectory,
+    generate_rotated_trajectory_series # New
 )
 from trajgen.sequences.radial import RadialSequence
-from trajgen.sequences.tpi import TwistedProjectionImagingSequence # For creating a 3D trajectory
+from trajgen.sequences.tpi import TwistedProjectionImagingSequence
+from trajgen.sequences.drunken_kooshball import DrunkenKooshballSequence # For 3D base trajectory
+
+
+class TestGenerateRotatedTrajectorySeries(unittest.TestCase):
+    def setUp(self):
+        # Create a simple 3D DrunkenKooshballSequence for testing
+        # Reduce points for speed
+        dk_params = {
+            'name': "BaseDK_for_series",
+            'fov_mm': (200.0, 200.0, 100.0),
+            'resolution_mm': (5.0, 5.0, 5.0), # Coarse res for fewer points
+            'num_points': 128, # Very few points for speed
+            'dt_seconds': 4e-6,
+            'base_spherical_spiral_turns': 2,
+            'perturbation_amplitude_factor': 0.01, # Low perturbation
+            'num_smoothing_iterations': 0, # No smoothing for predictable base
+        }
+        self.base_traj_3d = DrunkenKooshballSequence(**dk_params)
+
+        # Create a simple 2D trajectory for testing invalid input
+        radial_params = {
+            'name': "BaseRadial2D_for_series_fail",
+            'fov_mm': 200.0, 'resolution_mm': 4.0, 'num_dimensions': 2,
+            'dt_seconds': 4e-6, 'num_spokes': 4, 'points_per_spoke': 16,
+        }
+        self.base_traj_2d = RadialSequence(**radial_params)
+
+    def test_series_generation_z_axis(self):
+        num_frames = 3
+        axis_z = (0.0, 0.0, 1.0)
+        angle_increment_deg = 90.0
+
+        series = generate_rotated_trajectory_series(
+            base_trajectory_3d=self.base_traj_3d,
+            num_frames=num_frames,
+            rotation_axis=axis_z,
+            rotation_angle_increment_deg=angle_increment_deg,
+            output_name_template="z_rot_frame_{i:02d}_"
+        )
+
+        self.assertEqual(len(series), num_frames)
+        self.assertIsInstance(series[0], Trajectory)
+        self.assertEqual(series[0].name, "z_rot_frame_00_" + self.base_traj_3d.name)
+        self.assertEqual(series[1].name, "z_rot_frame_01_" + self.base_traj_3d.name)
+
+        original_k = self.base_traj_3d.kspace_points_rad_per_m
+
+        # Frame 0 (0 deg rotation)
+        np.testing.assert_array_almost_equal(series[0].kspace_points_rad_per_m, original_k)
+        self.assertEqual(series[0].metadata.get('frame_number'), 0)
+        self.assertAlmostEqual(series[0].metadata.get('series_cumulative_rotation_angle_deg'), 0.0)
+
+        # Frame 1 (90 deg rotation around Z)
+        # kx_new = -ky_old, ky_new = kx_old, kz_new = kz_old
+        expected_k_frame1 = np.vstack((-original_k[1,:], original_k[0,:], original_k[2,:]))
+        np.testing.assert_array_almost_equal(series[1].kspace_points_rad_per_m, expected_k_frame1, decimal=5)
+        self.assertEqual(series[1].metadata.get('frame_number'), 1)
+        self.assertAlmostEqual(series[1].metadata.get('series_cumulative_rotation_angle_deg'), 90.0)
+
+        # Frame 2 (180 deg rotation around Z)
+        # kx_new = -kx_old, ky_new = -ky_old, kz_new = kz_old
+        expected_k_frame2 = np.vstack((-original_k[0,:], -original_k[1,:], original_k[2,:]))
+        np.testing.assert_array_almost_equal(series[2].kspace_points_rad_per_m, expected_k_frame2, decimal=5)
+        self.assertEqual(series[2].metadata.get('frame_number'), 2)
+        self.assertAlmostEqual(series[2].metadata.get('series_cumulative_rotation_angle_deg'), 180.0)
+
+    def test_series_generation_x_axis(self):
+        num_frames = 2
+        axis_x = (1.0, 0.0, 0.0)
+        angle_increment_deg = 90.0 # Rotate by 90 deg for frame 1
+
+        series = generate_rotated_trajectory_series(
+            base_trajectory_3d=self.base_traj_3d,
+            num_frames=num_frames,
+            rotation_axis=axis_x,
+            rotation_angle_increment_deg=angle_increment_deg
+        )
+        self.assertEqual(len(series), num_frames)
+        original_k = self.base_traj_3d.kspace_points_rad_per_m
+
+        # Frame 1 (90 deg rotation around X)
+        # kx_new = kx_old, ky_new = -kz_old, kz_new = ky_old
+        expected_k_frame1 = np.vstack((original_k[0,:], -original_k[2,:], original_k[1,:]))
+        np.testing.assert_array_almost_equal(series[1].kspace_points_rad_per_m, expected_k_frame1, decimal=5)
+        self.assertEqual(series[1].metadata.get('frame_number'), 1)
+        self.assertAlmostEqual(series[1].metadata.get('series_cumulative_rotation_angle_deg'), 90.0)
+        self.assertEqual(series[1].metadata.get('series_rotation_axis'), axis_x)
+
+
+    def test_invalid_input_dimension_series(self):
+        with self.assertRaisesRegex(ValueError, "Input base_trajectory_3d must be 3-dimensional."):
+            generate_rotated_trajectory_series(self.base_traj_2d, num_frames=3)
+
+    def test_invalid_num_frames(self):
+        with self.assertRaisesRegex(ValueError, "Number of frames (num_frames) must be positive."):
+            generate_rotated_trajectory_series(self.base_traj_3d, num_frames=0)
+        with self.assertRaisesRegex(ValueError, "Number of frames (num_frames) must be positive."):
+            generate_rotated_trajectory_series(self.base_traj_3d, num_frames=-1)
 
 
 class TestRotate3DTrajectory(unittest.TestCase):

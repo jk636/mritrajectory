@@ -23,8 +23,109 @@ __all__ = [
     'reconstruct_image',
     'display_trajectory',
     'stack_2d_trajectory_to_3d',
-    'rotate_3d_trajectory' # New function
+    'rotate_3d_trajectory',
+    'generate_rotated_trajectory_series' # New function
 ]
+
+
+# Helper function for axis-angle rotation
+def _axis_angle_to_rotation_matrix(axis: Tuple[float, float, float], angle_rad: float) -> np.ndarray:
+    """
+    Generates a 3x3 rotation matrix for a given axis and angle using Rodrigues' formula.
+    """
+    axis_arr = np.asarray(axis, dtype=float)
+    norm = np.linalg.norm(axis_arr)
+    if norm < 1e-9: # Avoid division by zero for zero vector axis
+        return np.eye(3)
+    axis_arr /= norm
+
+    x, y, z = axis_arr
+    c = np.cos(angle_rad)
+    s = np.sin(angle_rad)
+    C = 1 - c
+
+    # Cross-product matrix K
+    K = np.array([[0, -z, y],
+                  [z, 0, -x],
+                  [-y, x, 0]])
+
+    # Rodrigues' rotation formula: R = I + sin(theta)*K + (1-cos(theta))*K^2
+    R = np.eye(3) + s * K + C * (K @ K)
+    return R
+
+
+def generate_rotated_trajectory_series(
+    base_trajectory_3d: Trajectory,
+    num_frames: int,
+    rotation_axis: Tuple[float, float, float] = (0.0, 0.0, 1.0), # Default Z-axis
+    rotation_angle_increment_deg: float = 180.0 * (3.0 - np.sqrt(5.0)), # Golden Angle approx.
+    output_name_template: str = "frame_{i:03d}_"
+) -> List[Trajectory]:
+    """
+    Generates a series of 3D trajectories by incrementally rotating a base 3D trajectory.
+
+    Args:
+        base_trajectory_3d (Trajectory): The input 3D Trajectory object to be rotated.
+        num_frames (int): The number of rotated trajectory frames to generate.
+        rotation_axis (Tuple[float, float, float]): The axis (x, y, z) around which to rotate.
+                                                    Defaults to Z-axis (0,0,1).
+        rotation_angle_increment_deg (float): The angle in degrees by which to increment
+                                              the rotation for each successive frame.
+                                              A common choice is the golden angle for uniform
+                                              distribution of orientations.
+        output_name_template (str): A format string template for naming each new trajectory.
+                                    Must contain '{i}' for the frame index.
+
+    Returns:
+        List[Trajectory]: A list of new 3D Trajectory objects, each rotated.
+
+    Raises:
+        ValueError: If the input trajectory is not 3D or if num_frames is not positive.
+    """
+    if base_trajectory_3d.get_num_dimensions() != 3:
+        raise ValueError("Input base_trajectory_3d must be 3-dimensional.")
+    if num_frames <= 0:
+        raise ValueError("Number of frames (num_frames) must be positive.")
+
+    rotated_trajectories: List[Trajectory] = []
+
+    for i in range(num_frames):
+        current_total_angle_deg = i * rotation_angle_increment_deg
+        current_total_angle_rad = np.deg2rad(current_total_angle_deg)
+
+        current_rotation_matrix = _axis_angle_to_rotation_matrix(
+            axis=rotation_axis,
+            angle_rad=current_total_angle_rad
+        )
+
+        # Format frame name using the template
+        try:
+            frame_name = output_name_template.format(i=i) + base_trajectory_3d.name
+        except KeyError: # If template doesn't have {i}
+            print(f"Warning: output_name_template ('{output_name_template}') does not contain '{{i}}'. Using default indexed naming.")
+            frame_name = f"frame_{i:03d}_" + base_trajectory_3d.name
+
+
+        # Use the existing rotate_3d_trajectory utility
+        # It creates a new Trajectory object and copies metadata.
+        rotated_frame_traj = rotate_3d_trajectory(
+            trajectory_3d=base_trajectory_3d, # Pass the original base trajectory each time
+            rotation_matrix=current_rotation_matrix,
+            output_name_prefix="" # We are handling the full name via frame_name
+        )
+        # Override the name that rotate_3d_trajectory might have set with its own prefix logic
+        rotated_frame_traj.name = frame_name
+
+        # Add specific metadata for this frame to the already copied metadata
+        rotated_frame_traj.metadata['frame_number'] = i
+        rotated_frame_traj.metadata['series_rotation_axis'] = rotation_axis
+        rotated_frame_traj.metadata['series_cumulative_rotation_angle_deg'] = current_total_angle_deg
+        rotated_frame_traj.metadata['series_base_trajectory_name'] = base_trajectory_3d.name
+        # The 'rotation_details' from rotate_3d_trajectory will contain the matrix used for this specific frame.
+
+        rotated_trajectories.append(rotated_frame_traj)
+
+    return rotated_trajectories
 
 
 def rotate_3d_trajectory(
