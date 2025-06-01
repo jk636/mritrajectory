@@ -28,6 +28,17 @@ The toolbox primarily consists of:
         *   `calculate_hardware_penalty(trajectory, grad_limit_Tm_per_m, slew_limit_Tm_per_s_per_m, penalty_factor)`: Penalizes exceeding specified gradient and slew rate limits.
         *   `calculate_gradient_roughness_penalty(trajectory, penalty_factor)`: Penalizes trajectories with "rough" or rapidly changing gradients, often used as a proxy for reducing acoustic noise. (Currently implemented as sum of squared slew magnitudes).
         *   `calculate_pns_proxy_penalty(trajectory, pns_threshold_T_per_s, penalty_factor)`: Penalizes trajectories if their maximum slew rate (used as a simplified proxy for PNS) exceeds a threshold.
+        *   `calculate_signal_decay_penalty(trajectory: Trajectory, T1_ms: Optional[float], T2_ms: float, b_value_s_per_mm2: float, k_space_weighting_func: Optional[Callable], is_13c: bool, penalty_factor: float) -> float`:
+            *   Calculates a penalty based on MR signal decay due to T1 (especially if `is_13c=True`), T2, and diffusion effects (`b_value_s_per_mm2`).
+            *   Penalizes late acquisition of k-space points, especially high k-space radii (weighted by `radii^2` or `radii^3` by default).
+            *   Allows an optional `k_space_weighting_func` to further define importance of k-space regions.
+            *   Includes an additional penalty if the total acquisition time significantly exceeds limits derived from T1/T2.
+        *   `calculate_psf_incoherence_penalty(trajectory: Trajectory, k_max_rad_per_m: float, target_density_func: Optional[Callable], penalty_factor: float, voronoi_qhull_options: str) -> float`:
+            *   Estimates k-space coverage quality and incoherence using Voronoi tessellation as a proxy for PSF properties.
+            *   Penalizes:
+                *   High variance in Voronoi cell sizes (squared coefficient of variation, indicating non-uniform sampling).
+                *   Deviation from a `target_density_func` if provided (compares normalized actual vs. target density profiles).
+                *   Large empty k-space regions (based on max distance from Voronoi vertices to k-space samples relative to average sample spacing).
 
 ## Workflow
 
@@ -62,5 +73,6 @@ This notebook demonstrates:
 -   **Initial Guess**: Providing a good initial guess can sometimes speed up convergence, though the optimizer can also start from the midpoint of bounds if an explicit guess is not provided.
 -   **Optimizer Method & Options**: Different `scipy.optimize.minimize` methods may perform better on different problems. `L-BFGS-B` is a good default for bound-constrained problems. `maxiter` in `optimizer_options` is important; complex problems may need many iterations. `disp: True` can provide more insight during the optimization run.
 -   **Normalization**: When combining different cost components (e.g., hardware penalties vs. roughness), ensure they are on a somewhat comparable scale, or that their weights reflect their relative importance accurately. The provided cost components use some internal normalization for penalties (e.g., dividing by the limit before squaring), but overall scaling might still need attention in your combined cost function.
+    - **`dt_seconds` for Time-Dependent Costs**: Ensure `dt_seconds` is correctly set in your `fixed_generator_params` when using time-dependent cost functions like `calculate_signal_decay_penalty`, as it's used by the `Trajectory` object (via `get_acquisition_times_ms()`) to calculate acquisition times.
 
 This toolbox provides a flexible way to move towards more automated and objective-driven trajectory design.

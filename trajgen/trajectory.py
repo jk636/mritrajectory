@@ -321,6 +321,27 @@ class Trajectory:
         """Returns the number of spatial dimensions (D)."""
         return self._D
 
+    def get_acquisition_times_ms(self) -> np.ndarray:
+        """
+        Calculates and returns the acquisition time for each k-space point in milliseconds.
+        The time of the first point is considered 0 ms.
+        Subsequent points are at multiples of dt_seconds.
+        """
+        if self.get_num_points() == 0:
+            return np.array([], dtype=float)
+
+        if self.dt_seconds is None or self.dt_seconds <= 0:
+            # This case indicates an issue with the Trajectory's state.
+            # dt_seconds should be positive if there are points.
+            print(f"Warning: dt_seconds is '{self.dt_seconds}' in get_acquisition_times_ms "
+                  f"for trajectory '{self.name}' with {self.get_num_points()} points. "
+                  "Acquisition times will be returned as zeros, which may be incorrect.")
+            return np.zeros(self.get_num_points(), dtype=float)
+
+        # np.arange creates sequence [0, 1, ..., N-1]
+        # Times are 0, dt, 2*dt, ... (N-1)*dt
+        return np.arange(self.get_num_points()) * self.dt_seconds * 1000.0 # Convert to ms
+
     def export(self, filename: str, filetype: Optional[str] = None) -> None:
         """
         Exports trajectory data to a file.
